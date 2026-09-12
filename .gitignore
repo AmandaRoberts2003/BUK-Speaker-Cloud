@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+speaker_groups.db
+.env
