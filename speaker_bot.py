@@ -476,7 +476,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != ChatType.PRIVATE:
         return
 
-    message = " ".join(context.args).strip().replace("\\n", "\n")
+    message = update.effective_message.text.partition(" ")[2].strip()
     if not message:
         await update.effective_message.reply_text(
             "Please provide a message after the command.\nExample: /broadcast Office will be closed tomorrow."
