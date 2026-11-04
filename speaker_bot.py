@@ -17,7 +17,7 @@ from telegram.ext import (
 
 # Keep credentials in the cloud host's environment variables, never in source code.
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "7616118484"))
+ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "488671902"))
 
 DATA_DIR = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
