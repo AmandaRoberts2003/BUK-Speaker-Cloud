@@ -469,46 +469,86 @@ async def retrywelcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Broadcast only when the administrator explicitly uses /broadcast."""
+    """Admin-only broadcast of text, or a replied-to photo/video as one message."""
     if not is_admin(update):
         await update.effective_message.reply_text("⛔ You are not authorized to use this bot.")
         return
     if update.effective_chat.type != ChatType.PRIVATE:
         return
 
-    message = update.effective_message.text.partition(" ")[2].strip()
-    if not message:
-        await update.effective_message.reply_text(
-            "Please provide a message after the command.\nExample: /broadcast Office will be closed tomorrow."
+    command_message = update.effective_message
+    source_message = command_message.reply_to_message
+
+    # Reply to a photo/video with /broadcast to copy the original media and
+    # its caption together into every registered group.
+    media_message = (
+        source_message is not None
+        and (
+            source_message.photo
+            or source_message.video
+            or source_message.animation
+            or source_message.document
         )
-        return
+    )
+
+    if media_message:
+        broadcast_text = None
+    else:
+        broadcast_text = command_message.text.partition(" ")[2].strip().replace("\\n", "\n")
+        if not broadcast_text:
+            await command_message.reply_text(
+                "To broadcast a photo or video: send it to me with its caption, "
+                "then reply to that media message with /broadcast.\n\n"
+                "For a text-only announcement, use:\n"
+                "/broadcast Your announcement here."
+            )
+            return
 
     with get_connection() as conn:
-        groups = conn.execute("SELECT chat_id, group_name FROM groups ORDER BY group_name").fetchall()
+        groups = conn.execute(
+            "SELECT chat_id, group_name FROM groups ORDER BY group_name"
+        ).fetchall()
 
     if not groups:
-        await update.effective_message.reply_text("❌ No groups are registered yet.")
+        await command_message.reply_text("❌ No groups are registered yet.")
         return
 
     successful = 0
     failed = []
     for chat_id, group_name in groups:
         try:
-            await context.bot.send_message(chat_id=chat_id, text=message)
+            if media_message:
+                await context.bot.copy_message(
+                    chat_id=chat_id,
+                    from_chat_id=source_message.chat_id,
+                    message_id=source_message.message_id,
+                )
+            else:
+                await context.bot.send_message(chat_id=chat_id, text=broadcast_text)
             successful += 1
         except RetryAfter as error:
             await asyncio.sleep(float(error.retry_after) + 1)
             try:
-                await context.bot.send_message(chat_id=chat_id, text=message)
+                if media_message:
+                    await context.bot.copy_message(
+                        chat_id=chat_id,
+                        from_chat_id=source_message.chat_id,
+                        message_id=source_message.message_id,
+                    )
+                else:
+                    await context.bot.send_message(chat_id=chat_id, text=broadcast_text)
                 successful += 1
             except TelegramError:
                 failed.append(group_name)
+                logger.exception("Broadcast retry failed for %s (%s)", group_name, chat_id)
         except TelegramError:
             failed.append(group_name)
+            logger.exception("Broadcast failed for %s (%s)", group_name, chat_id)
         await asyncio.sleep(0.05)
 
+    content_type = "media announcement" if media_message else "text announcement"
     report = (
-        "📢 Broadcast completed!\n\n"
+        f"📢 {content_type.capitalize()} broadcast completed!\n\n"
         f"✅ Delivered: {successful}/{len(groups)}\n"
         f"❌ Failed: {len(failed)}"
     )
@@ -516,7 +556,7 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report += "\n\nFailed groups: " + ", ".join(failed[:10])
         if len(failed) > 10:
             report += f" (+{len(failed) - 10} more)"
-    await update.effective_message.reply_text(report)
+    await command_message.reply_text(report)
 
 
 def main():
