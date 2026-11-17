@@ -365,6 +365,13 @@ def init_database():
             sent_at TEXT NOT NULL,
             PRIMARY KEY (chat_id, event)
         )""")
+        # Explicit group-to-vehicle links are never inferred from names.
+        conn.execute("""CREATE TABLE IF NOT EXISTS samsara_group_links (
+            chat_id INTEGER PRIMARY KEY,
+            vehicle_id TEXT NOT NULL UNIQUE,
+            linked_at TEXT NOT NULL,
+            linked_by INTEGER NOT NULL
+        )""")
         # Archive is shared by authorized admins; no Telegram private-chat access is granted.
         conn.execute("""CREATE TABLE IF NOT EXISTS announcements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -565,12 +572,243 @@ async def on_group_title_change(update: Update, context: ContextTypes.DEFAULT_TY
             conn.execute("UPDATE groups SET group_name = ? WHERE chat_id = ?", (title, update.effective_chat.id))
 
 
+# SAMSARA PHASE 2: read-only GPS + PRIVATE preview. Never automatically sends to groups.
+# Require explicit exact ID links; group names/unit numbers are not safe identifiers.
+SAMSARA_API_TOKEN = os.getenv("SAMSARA_API_TOKEN", "").strip()
+SAMSARA_API_BASE = "https://api.samsara.com"
+SAMSARA_MAX_GPS_AGE_MINUTES = max(1, min(60, int(os.getenv("SAMSARA_MAX_GPS_AGE_MINUTES", "15"))))
+
+
+def samsara_valid_gps(gps, now=None):
+    """Reject old, future, unparseable or out-of-bounds GPS. Never extrapolate."""
+    now = now or datetime.now(timezone.utc)
+    if not isinstance(gps, dict):
+        return None
+    ts = weather_parse_time(gps.get("time"))
+    if ts is None or ts > now + timedelta(minutes=1) or now - ts > timedelta(minutes=SAMSARA_MAX_GPS_AGE_MINUTES):
+        return None
+    lat, lon = gps.get("latitude"), gps.get("longitude")
+    if type(lat) not in (int, float) or type(lon) not in (int, float):
+        return None
+    if not (18 <= lat <= 72 and -180 <= lon <= -60):
+        return None
+    return lat, lon, ts
+
+
+def samsara_get_gps_snapshot():
+    """Current fleet GPS snapshot, read-only. Paginate; never log credentials."""
+    if not SAMSARA_API_TOKEN:
+        raise ValueError("Samsara token is not configured")
+    result = {}
+    cursor = None
+    seen_cursors = set()
+    for _ in range(20):
+        params = {"types": "gps"}
+        if cursor:
+            params["after"] = cursor
+        url = SAMSARA_API_BASE + "/fleet/vehicles/stats?" + urllib.parse.urlencode(params)
+        request = urllib.request.Request(url, headers={
+            "Authorization": "Bearer " + SAMSARA_API_TOKEN,
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(request, timeout=18) as response:
+            payload = json.load(response)
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            raise ValueError("Unexpected Samsara API response")
+        for record in payload["data"]:
+            if isinstance(record, dict) and record.get("id") is not None:
+                result[str(record["id"])] = record
+        pg = payload.get("pagination") or {}
+        if not pg.get("hasNextPage"):
+            return result
+        new_cursor = pg.get("endCursor")
+        if not isinstance(new_cursor, str) or not new_cursor or new_cursor in seen_cursors:
+            raise ValueError("Invalid Samsara pagination")
+        seen_cursors.add(new_cursor)
+        cursor = new_cursor
+    raise ValueError("Samsara snapshot exceeded safe page limit")
+
+
+async def samsara_snapshot_or_error(update):
+    if not SAMSARA_API_TOKEN:
+        await update.effective_message.reply_text(
+            "Samsara not connected. Add SAMSARA_API_TOKEN in FadeHost Settings first."
+        )
+        return None
+    try:
+        return await asyncio.to_thread(samsara_get_gps_snapshot)
+    except Exception as error:
+        # Avoid logging raw HTTP request objects, which could contain tokens.
+        logger.warning("Samsara snapshot unavailable (%s)", type(error).__name__)
+        await update.effective_message.reply_text(
+            "Samsara GPS data unavailable or access denied. No messages sent to driver groups."
+        )
+        return None
+
+
+def samsara_private_admin(update):
+    return bool(is_admin(update) and update.effective_chat and
+                update.effective_chat.type == ChatType.PRIVATE)
+
+
+async def samsarastatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not samsara_private_admin(update):
+        return
+    with get_connection() as conn:
+        links = conn.execute("SELECT COUNT(*) FROM samsara_group_links").fetchone()[0]
+    await update.effective_message.reply_text(
+        f"Samsara token: {'configured' if SAMSARA_API_TOKEN else 'NOT CONFIGURED'}\n"
+        f"Verified group-to-vehicle links: {links}\n"
+        f"GPS max age: {SAMSARA_MAX_GPS_AGE_MINUTES} minutes\n"
+        "Samsara weather delivery: OFF (private preview only)\n"
+        "Automatic driver weather messages: NOT ENABLED by this integration."
+    )
+
+
+async def samsaraunits_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not samsara_private_admin(update):
+        return
+    data = await samsara_snapshot_or_error(update)
+    if data is None:
+        return
+    pattern = " ".join(context.args).casefold().strip()
+    matching = [(vid, rec) for vid, rec in data.items()
+                if not pattern or pattern in str(rec.get("name", "")).casefold() or pattern in vid.casefold()]
+    matching.sort(key=lambda entry: str(entry[1].get("name", "")))
+    lines = [f"{str(rec.get('name') or 'Unnamed')[:45]} | ID: {vid}" for vid, rec in matching[:20]]
+    await update.effective_message.reply_text(
+        f"Samsara vehicles matching query: {len(matching)}\n" +
+        ("\n".join(lines) if lines else "No matches") +
+        "\n\nPrivate admin view only. Use exact vehicle ID for linking."
+    )
+
+
+async def samsaralink_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Private linking by exact chat ID + exact Samsara vehicle ID; avoid bad guesses."""
+    if not samsara_private_admin(update):
+        return
+    if len(context.args) != 2:
+        await update.effective_message.reply_text("Usage: /samsaralink GROUP_CHAT_ID SAMSARA_VEHICLE_ID")
+        return
+    try:
+        chat_id = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("Invalid Telegram group ID.")
+        return
+    vehicle_id = context.args[1].strip()
+    live = await get_live_group(chat_id, context)
+    if not live or live.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or not live.title or is_inactive_group_name(live.title):
+        await update.effective_message.reply_text("Link not saved: active group could not be verified.")
+        return
+    with get_connection() as conn:
+        registered = conn.execute("SELECT 1 FROM groups WHERE chat_id=?", (chat_id,)).fetchone()
+    if not registered:
+        await update.effective_message.reply_text("Group not registered in BUK Speaker; use /addgroup first.")
+        return
+    vehicles = await samsara_snapshot_or_error(update)
+    if vehicles is None:
+        return
+    if vehicle_id not in vehicles:
+        await update.effective_message.reply_text("Vehicle ID not found in Samsara. No link saved.")
+        return
+    with get_connection() as conn:
+        # Prevent one vehicle ID from silently attaching to multiple driver groups.
+        existing = conn.execute("SELECT chat_id FROM samsara_group_links WHERE vehicle_id=?", (vehicle_id,)).fetchone()
+        if existing and existing[0] != chat_id:
+            await update.effective_message.reply_text("Vehicle is already linked to a different group; unlink it first.")
+            return
+        conn.execute("""INSERT INTO samsara_group_links (chat_id, vehicle_id, linked_at, linked_by)
+            VALUES (?, ?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET vehicle_id=excluded.vehicle_id,
+            linked_at=excluded.linked_at, linked_by=excluded.linked_by""",
+            (chat_id, vehicle_id, datetime.now(timezone.utc).isoformat(), update.effective_user.id))
+    await update.effective_message.reply_text(
+        f"Linked group: {live.title}\n"
+        f"Samsara vehicle: {vehicles[vehicle_id].get('name', 'Unnamed')} (ID {vehicle_id})\n"
+        "This link enables PRIVATE GPS/weather previews only; no group weather alerts."
+    )
+
+
+async def samsaraunlink_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not samsara_private_admin(update):
+        return
+    if len(context.args) != 1:
+        await update.effective_message.reply_text("Usage: /samsaraunlink GROUP_CHAT_ID")
+        return
+    try:
+        chat_id = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("Invalid group ID")
+        return
+    with get_connection() as conn:
+        deleted = conn.execute("DELETE FROM samsara_group_links WHERE chat_id=?", (chat_id,)).rowcount
+    await update.effective_message.reply_text("Group link removed." if deleted else "No link found for that group.")
+
+
+async def samsarapreview_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-only, real GPS -> actual NWS alerts. NEVER messages the linked group."""
+    if not samsara_private_admin(update):
+        return
+    if len(context.args) != 1:
+        await update.effective_message.reply_text("Usage: /samsarapreview GROUP_CHAT_ID")
+        return
+    try:
+        chat_id = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("Invalid group ID")
+        return
+    with get_connection() as conn:
+        link = conn.execute("SELECT vehicle_id FROM samsara_group_links WHERE chat_id=?", (chat_id,)).fetchone()
+    if not link:
+        await update.effective_message.reply_text("No verified vehicle link for this group.")
+        return
+    live = await get_live_group(chat_id, context)
+    if not live or not live.title or is_inactive_group_name(live.title):
+        await update.effective_message.reply_text("Inactive or unverified group; skipped.")
+        return
+    data = await samsara_snapshot_or_error(update)
+    if data is None:
+        return
+    vehicle = data.get(link[0])
+    if not vehicle:
+        await update.effective_message.reply_text("Linked vehicle missing from Samsara snapshot. Skipped.")
+        return
+    gps = samsara_valid_gps(vehicle.get("gps"))
+    if gps is None:
+        await update.effective_message.reply_text("GPS is stale, missing, or outside supported area. Skipped.")
+        return
+    lat, lon, timestamp = gps
+    await update.effective_message.reply_text(
+        f"PRIVATE WEATHER PREVIEW\n"
+        f"Group: {live.title}\n"
+        f"Truck: {vehicle.get('name') or link[0]}\n"
+        f"GPS timestamp (UTC): {timestamp:%Y-%m-%d %H:%M}\n"
+        "No driver group messages will be sent."
+    )
+    try:
+        features = await asyncio.to_thread(nws_get_active_point, lat, lon)
+    except Exception:
+        logger.warning("NWS preview request failed; withheld", exc_info=False)
+        await update.effective_message.reply_text("NWS currently unavailable. No alert sent.")
+        return
+    valid = [item for feature in features if (item := weather_active_record(feature)) is not None]
+    if not valid:
+        await update.effective_message.reply_text("No qualifying active NWS warnings at this truck location right now.")
+        return
+    for item in valid[:5]:
+        await update.effective_message.reply_text(weather_message(item), parse_mode="HTML")
+    if len(valid) > 5:
+        await update.effective_message.reply_text(f"{len(valid)-5} additional warnings not shown.")
+
+
 # WEATHER PHASE 1: Official NWS point alerts only. No DOT, route, or Samsara
 # claims are made here. Driver delivery is OFF until explicitly enabled.
 # Two independent switches prevent accidental production notifications on upgrade.
 WEATHER_REQUESTED = os.getenv("WEATHER_ALERTS_ENABLED", "false").lower() == "true"
 WEATHER_TEMPLATES_APPROVED = os.getenv("WEATHER_TEMPLATES_APPROVED", "false").lower() == "true"
-WEATHER_ENABLED = WEATHER_REQUESTED and WEATHER_TEMPLATES_APPROVED
+# v11 testing gate: do not send automated weather to any group, even if old
+# environment flags were mistakenly left enabled. Later release must explicitly
+# replace this hard gate after admin approval and Samsara mapping validation.
+WEATHER_ENABLED = False
 WEATHER_POLL_SECONDS = max(120, int(os.getenv("WEATHER_POLL_SECONDS", "180")))
 # A manually supplied monitoring point expires quickly; it is NOT live GPS.
 WEATHER_POINT_TTL_HOURS = 6
@@ -983,7 +1221,7 @@ async def weather_post_shutdown(app):
 
 
 
-SPEAKER_BUILD = "2026-11-17-weather-spaced-preview-v10"
+SPEAKER_BUILD = "2026-11-17-samsara-private-preview-v11"
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -997,7 +1235,8 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Shared announcement history: enabled\n"
         "Automatic admin broadcast sharing: enabled\n"
         f"NWS weather monitoring: {'ON' if WEATHER_ENABLED else 'OFF (safe default)'}\n"
-        f"Authorized admins: {len(ADMIN_USER_IDS)}"
+        f"Authorized admins: {len(ADMIN_USER_IDS)}\n"
+        "Samsara integration: PRIVATE PREVIEW ONLY"
     )
 
 
@@ -1248,6 +1487,11 @@ def main():
     app.add_handler(CommandHandler("retrywelcome", retrywelcome))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("version", version_command))
+    app.add_handler(CommandHandler("samsarastatus", samsarastatus_command))
+    app.add_handler(CommandHandler("samsaraunits", samsaraunits_command))
+    app.add_handler(CommandHandler("samsaralink", samsaralink_command))
+    app.add_handler(CommandHandler("samsaraunlink", samsaraunlink_command))
+    app.add_handler(CommandHandler("samsarapreview", samsarapreview_command))
     app.add_handler(CommandHandler("weatherpoint", weatherpoint_command))
     app.add_handler(CommandHandler("weatheroff", weatheroff_command))
     app.add_handler(CommandHandler("weatherstatus", weatherstatus_command))
