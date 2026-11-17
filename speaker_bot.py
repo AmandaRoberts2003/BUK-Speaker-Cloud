@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import sqlite3
+from datetime import datetime, timezone
 from contextlib import contextmanager
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -336,11 +337,25 @@ def init_database():
             row[1] for row in conn.execute("PRAGMA table_info(groups)").fetchall()
         }
         if "welcome_sent" not in columns:
-            # Existing registered groups are treated as already introduced, so
-            # upgrading will not unexpectedly send the welcome to old groups.
+            # Existing registered groups retain their one-time welcome status.
             conn.execute(
                 "ALTER TABLE groups ADD COLUMN welcome_sent INTEGER NOT NULL DEFAULT 1"
             )
+        # Archive is shared by authorized admins; no Telegram private-chat access is granted.
+        conn.execute("""CREATE TABLE IF NOT EXISTS announcements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            sender_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            body TEXT,
+            source_chat_id INTEGER,
+            source_message_id INTEGER,
+            delivered INTEGER NOT NULL,
+            inactive INTEGER NOT NULL,
+            unverified INTEGER NOT NULL,
+            failed INTEGER NOT NULL,
+            report TEXT NOT NULL
+        )""")
 
 
 def is_admin(update: Update) -> bool:
@@ -526,7 +541,7 @@ async def on_group_title_change(update: Update, context: ContextTypes.DEFAULT_TY
             conn.execute("UPDATE groups SET group_name = ? WHERE chat_id = ?", (title, update.effective_chat.id))
 
 
-SPEAKER_BUILD = "2026-11-17-active-filter-media-multiadmin-v4"
+SPEAKER_BUILD = "2026-11-17-admin-shared-history-v5"
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -537,6 +552,7 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"BUK Speaker build: {SPEAKER_BUILD}\n"
         "Inactive-group check: enabled (live Telegram group titles)\n"
         "Media broadcasting: enabled\n"
+        "Shared announcement history: enabled\n"
         f"Authorized admins: {len(ADMIN_USER_IDS)}"
     )
 
@@ -647,7 +663,109 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report += "\n\nFailed groups: " + ", ".join(failed[:10])
     if unverified:
         report += "\n\nUnverified groups: " + ", ".join(unverified[:10])
-    await command_message.reply_text(report)
+    # Save finished broadcasts so every authorized admin can review future announcements.
+    created_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    with get_connection() as conn:
+        cursor = conn.execute(
+            """INSERT INTO announcements
+            (created_at, sender_id, kind, body, source_chat_id, source_message_id,
+             delivered, inactive, unverified, failed, report)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                created_at, update.effective_user.id,
+                "media" if media_message else "text",
+                (source_message.caption if media_message else broadcast_text),
+                source_message.chat_id if media_message else None,
+                source_message.message_id if media_message else None,
+                delivered, len(inactive), len(unverified), len(failed), report,
+            ),
+        )
+        announcement_id = cursor.lastrowid
+
+    await command_message.reply_text(f"Announcement #{announcement_id}\n\n{report}")
+
+    # Telegram allows private DMs only after a recipient has started the bot.
+    # Notification failures must never change the completed delivery result.
+    for other_admin_id in ADMIN_USER_IDS - {update.effective_user.id}:
+        try:
+            await context.bot.send_message(
+                chat_id=other_admin_id,
+                text=(f"📢 New BUK Speaker announcement #{announcement_id}\n"
+                      f"From admin ID: {update.effective_user.id}\n"
+                      f"Date: {created_at}\n\n"
+                      f"Use /announcement {announcement_id} to review the announcement.\n\n"
+                      + report),
+            )
+        except TelegramError:
+            logger.warning("Could not privately notify admin ID %s; ask them to send /start", other_admin_id)
+
+
+async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """List the latest archived broadcasts in any authorized admin's private chat."""
+    if not is_admin(update) or update.effective_chat.type != ChatType.PRIVATE:
+        await update.effective_message.reply_text("⛔ Admin-only private command.")
+        return
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT id, created_at, sender_id, kind, body, delivered, inactive
+               FROM announcements ORDER BY id DESC LIMIT 15"""
+        ).fetchall()
+    if not rows:
+        await update.effective_message.reply_text(
+            "No archived broadcasts yet. History starts with this version; older Telegram messages are not imported."
+        )
+        return
+    lines = ["📚 BUK Speaker — recent announcements (newest first)"]
+    for item_id, created, sender, kind, body, delivered, inactive in rows:
+        snippet = (body or "[media without caption]").replace("\n", " ")[:65]
+        lines.append(
+            f"\n#{item_id} • {created} • Admin {sender}\n"
+            f"{kind}: {snippet}\n✅ {delivered} delivered, ⏭️ {inactive} inactive skipped"
+        )
+    lines.append("\nUse /announcement NUMBER to view the full message and report.")
+    await update.effective_message.reply_text("\n".join(lines))
+
+
+async def announcement_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Review any archived announcement, with media when Telegram permits copying."""
+    if not is_admin(update) or update.effective_chat.type != ChatType.PRIVATE:
+        await update.effective_message.reply_text("⛔ Admin-only private command.")
+        return
+    if len(context.args) != 1 or not context.args[0].isdecimal():
+        await update.effective_message.reply_text("Usage: /announcement 12")
+        return
+    with get_connection() as conn:
+        row = conn.execute(
+            """SELECT created_at, sender_id, kind, body, source_chat_id,
+                      source_message_id, report FROM announcements WHERE id=?""",
+            (int(context.args[0]),),
+        ).fetchone()
+    if not row:
+        await update.effective_message.reply_text("Announcement not found in the archive.")
+        return
+    created, sender, kind, body, source_chat, source_id, report = row
+    header = f"📢 Announcement #{context.args[0]}\nDate: {created}\nAdmin ID: {sender}\n"
+    if kind == "text":
+        text = body or ""
+        # Text messages can approach Telegram's 4096-character limit.
+        await update.effective_message.reply_text(header + "\n" + report)
+        for i in range(0, len(text), 3500):
+            await update.effective_message.reply_text(text[i:i+3500])
+    else:
+        await update.effective_message.reply_text(header + "\n" + report)
+        if source_chat is not None and source_id is not None:
+            try:
+                await context.bot.copy_message(
+                    chat_id=update.effective_user.id,
+                    from_chat_id=source_chat,
+                    message_id=source_id,
+                )
+            except TelegramError:
+                await update.effective_message.reply_text(
+                    "This media is no longer available to copy from the original conversation."
+                )
+        else:
+            await update.effective_message.reply_text(body or "[No media reference available]")
 
 
 def main():
@@ -665,6 +783,8 @@ def main():
     app.add_handler(CommandHandler("retrywelcome", retrywelcome))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("version", version_command))
+    app.add_handler(CommandHandler("history", history_command))
+    app.add_handler(CommandHandler("announcement", announcement_command))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_TITLE, on_group_title_change))
     app.add_handler(
         ChatMemberHandler(on_bot_membership_change, ChatMemberHandler.MY_CHAT_MEMBER)
