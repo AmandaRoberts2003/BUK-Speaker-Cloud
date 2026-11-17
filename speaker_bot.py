@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import html
 import os
 import re
 import sqlite3
@@ -686,41 +687,67 @@ def nws_get_active_point(latitude, longitude):
     return data["features"]
 
 
+# Telegram-native Unicode emojis and HTML bold; no external sticker files.
+WEATHER_EMOJI = {
+    "Tornado Warning": "🌪️", "Flash Flood Warning": "🌊",
+    "Blizzard Warning": "❄️", "Winter Storm Warning": "❄️",
+    "Ice Storm Warning": "🧊", "Snow Squall Warning": "🌨️",
+    "High Wind Warning": "💨", "Extreme Wind Warning": "💨",
+    "Severe Thunderstorm Warning": "⛈️", "Dust Storm Warning": "🌫️",
+    "Winter Weather Advisory": "❄️", "Wind Advisory": "💨",
+    "Dense Fog Advisory": "🌫️", "Freezing Fog Advisory": "🌫️",
+    "Flood Advisory": "🌧️", "Heat Advisory": "🌡️",
+    "Cold Weather Advisory": "🥶", "Extreme Cold Warning": "🥶",
+    "Extreme Heat Warning": "🌡️", "Flood Warning": "🌊",
+    "Hurricane Warning": "🌀", "Tropical Storm Warning": "🌀",
+    "Red Flag Warning": "🔥",
+}
+PREVIEW_EMOJI = {"snow": "❄️", "rain": "🌧️", "ice": "🧊",
+                 "fog": "🌫️", "wind": "💨", "tornado": "🌪️"}
+
+
+def weather_heading(event, general=False):
+    if event in {"Tornado Warning", "Flash Flood Warning", "Snow Squall Warning"}:
+        return "🚨 URGENT WEATHER ALERT"
+    if general:
+        return "🌤️ WEATHER ADVISORY"
+    return "⚠️ SEVERE WEATHER ALERT"
+
+
 def weather_message(info):
-    """Concise, source-backed driver notification, with no invented conditions."""
-    fmt = lambda dt: dt.strftime("%b %d, %I:%M %p UTC")
+    """Only official, validated NWS fields; safe HTML formatting for Telegram."""
     event = info["event"]
-    general = event in GENERAL_ADVISORY_EVENTS
-    heading = ("WEATHER ADVISORY" if general else
-               "URGENT WEATHER ALERT" if event in {"Tornado Warning", "Flash Flood Warning", "Snow Squall Warning"} else
-               "SEVERE WEATHER ALERT")
-    # NWS areas sometimes list dozens of counties. Keep the official area text,
-    # but avoid sending an ambiguous partial county name if very long.
+    heading = weather_heading(event, event in GENERAL_ADVISORY_EVENTS)
     area = info["area"]
     if len(area) > 250:
         area = area[:245].rsplit(";", 1)[0] + "; ... (see NWS alert)"
-    lines = [heading,
-             f"Hazard: {event}",
-             f"Area: {area}",
-             f"NWS alert expires: {fmt(info['expires'])}"]
-    if event in EVENT_ACTIONS:
-        lines.append(f"Safety action: {EVENT_ACTIONS[event]}")
-    lines.append("Source: National Weather Service")
+    fmt = lambda dt: dt.strftime("%b %d, %I:%M %p UTC")
+    lines = [f"<b>{heading}</b>",
+             f"{WEATHER_EMOJI.get(event, '⚠️')} <b>Hazard:</b> {html.escape(event)}",
+             f"📍 <b>Area:</b> {html.escape(area)}",
+             f"🕒 <b>NWS Alert Expires:</b> {fmt(info['expires'])}"]
+    action = EVENT_ACTIONS.get(event)
+    if action:
+        lines.append(f"🚛 <b>Driver Action:</b> {html.escape(action)}")
+    lines.append("<i>Source: National Weather Service</i>")
     return "\n".join(lines)
 
 
 def weather_preview_message(kind):
-    """Static private-chat examples; never masquerade as actual live data."""
-    heading, event, condition, action = PREVIEW_EXAMPLES[kind]
-    return (f"[SAMPLE - NOT A LIVE ALERT]\n{heading}\n"
-            f"Hazard: {event}\n"
-            f"Conditions: {condition}\n"
-            f"Safety action: {action}\n"
-            "Source: Example wording for administrator approval")
+    """Sample text only, private to admins; never a live alert."""
+    _, event, condition, action = PREVIEW_EXAMPLES[kind]
+    heading = ("🚨 URGENT WEATHER ALERT" if kind == "tornado"
+               else f"{PREVIEW_EMOJI[kind]} GENERAL WEATHER REMINDER")
+    return (f"🧪 <b>SAMPLE - NOT A LIVE ALERT</b>\n"
+            f"<b>{heading}</b>\n"
+            f"{PREVIEW_EMOJI[kind]} <b>Hazard:</b> {html.escape(event)}\n"
+            f"<b>Conditions:</b> {html.escape(condition)}\n"
+            f"🚛 <b>Driver Action:</b> {html.escape(action)}\n"
+            "<i>Preview for administrator approval only</i>")
 
 
 async def weatherpreview_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Never broadcasts; previews every alert style in the admin's private chat."""
+    """Administrator-only private template review; never group broadcasts."""
     if not is_admin(update) or update.effective_chat.type != ChatType.PRIVATE:
         return
     kind = context.args[0].lower() if context.args else "all"
@@ -730,8 +757,9 @@ async def weatherpreview_command(update: Update, context: ContextTypes.DEFAULT_T
         return
     keys = list(PREVIEW_EXAMPLES) if kind == "all" else [kind]
     for name in keys:
-        await update.effective_message.reply_text(weather_preview_message(name),
-                                                  disable_web_page_preview=True)
+        await update.effective_message.reply_text(
+            weather_preview_message(name), parse_mode="HTML",
+            disable_web_page_preview=True)
 
 
 async def weathercheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -767,7 +795,7 @@ async def weathercheck_command(update: Update, context: ContextTypes.DEFAULT_TYP
         f"PRIVATE PREVIEW | {len(items)} qualifying active NWS alert(s). Nothing sent to groups.")
     for item in items[:8]:
         await update.effective_message.reply_text(weather_message(item),
-                                                 disable_web_page_preview=True)
+                                                 parse_mode="HTML", disable_web_page_preview=True)
     if len(items) > 8:
         await update.effective_message.reply_text(f"{len(items)-8} additional alerts omitted from preview.")
 
@@ -892,7 +920,7 @@ async def weather_scan(context):
                 break
             try:
                 await context.bot.send_message(chat_id=chat_id, text=weather_message(item),
-                                               disable_web_page_preview=True)
+                                               parse_mode="HTML", disable_web_page_preview=True)
             except TelegramError:
                 logger.exception("NWS alert delivery failed for chat %s", chat_id)
                 continue
@@ -935,7 +963,7 @@ async def weather_post_shutdown(app):
 
 
 
-SPEAKER_BUILD = "2026-11-17-weather-template-preview-v8"
+SPEAKER_BUILD = "2026-11-17-weather-formatted-preview-v9"
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
