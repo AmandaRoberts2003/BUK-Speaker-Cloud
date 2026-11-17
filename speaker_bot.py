@@ -505,6 +505,20 @@ async def on_group_title_change(update: Update, context: ContextTypes.DEFAULT_TY
             conn.execute("UPDATE groups SET group_name = ? WHERE chat_id = ?", (title, update.effective_chat.id))
 
 
+SPEAKER_BUILD = "2026-11-17-active-filter-media-v3"
+
+
+async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Private admin-only deployment check; never broadcast this response."""
+    if not is_admin(update) or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    await update.effective_message.reply_text(
+        f"BUK Speaker build: {SPEAKER_BUILD}\n"
+        "Inactive-group check: enabled (live Telegram group titles)\n"
+        "Media broadcasting: enabled"
+    )
+
+
 async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin-only text/media broadcast to verified ACTIVE groups exclusively."""
     if not is_admin(update):
@@ -628,12 +642,13 @@ def main():
     app.add_handler(CommandHandler("addgroup", addgroup))
     app.add_handler(CommandHandler("retrywelcome", retrywelcome))
     app.add_handler(CommandHandler("broadcast", broadcast))
+    app.add_handler(CommandHandler("version", version_command))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_TITLE, on_group_title_change))
     app.add_handler(
         ChatMemberHandler(on_bot_membership_change, ChatMemberHandler.MY_CHAT_MEMBER)
     )
 
-    logger.info("BUK Speaker Bot is running")
+    logger.info("BUK Speaker Bot running build %s", SPEAKER_BUILD)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
