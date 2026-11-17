@@ -20,7 +20,28 @@ from telegram.ext import (
 
 # Keep credentials in the cloud host's environment variables, never in source code.
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+# Existing primary admin remains authorized. Add two more admins in FadeHost's
+# environment variables using their NUMERIC Telegram user IDs (not usernames).
 ADMIN_USER_ID = int(os.getenv("ADMIN_USER_ID", "488671902"))
+
+
+def load_admin_user_ids():
+    """Preserve primary admin, and load additional trusted administrators."""
+    raw = os.getenv("ADDITIONAL_ADMIN_USER_IDS", "")
+    ids = {ADMIN_USER_ID}
+    for value in raw.split(","):
+        value = value.strip()
+        if not value:
+            continue
+        if not value.isdecimal() or int(value) <= 0:
+            raise ValueError(
+                "ADDITIONAL_ADMIN_USER_IDS must contain comma-separated numeric Telegram user IDs"
+            )
+        ids.add(int(value))
+    return frozenset(ids)
+
+
+ADMIN_USER_IDS = load_admin_user_ids()
 
 DATA_DIR = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -325,7 +346,7 @@ def init_database():
 def is_admin(update: Update) -> bool:
     return (
         update.effective_user is not None
-        and update.effective_user.id == ADMIN_USER_ID
+        and update.effective_user.id in ADMIN_USER_IDS
     )
 
 
@@ -505,7 +526,7 @@ async def on_group_title_change(update: Update, context: ContextTypes.DEFAULT_TY
             conn.execute("UPDATE groups SET group_name = ? WHERE chat_id = ?", (title, update.effective_chat.id))
 
 
-SPEAKER_BUILD = "2026-11-17-active-filter-media-v3"
+SPEAKER_BUILD = "2026-11-17-active-filter-media-multiadmin-v4"
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -515,7 +536,8 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         f"BUK Speaker build: {SPEAKER_BUILD}\n"
         "Inactive-group check: enabled (live Telegram group titles)\n"
-        "Media broadcasting: enabled"
+        "Media broadcasting: enabled\n"
+        f"Authorized admins: {len(ADMIN_USER_IDS)}"
     )
 
 
@@ -648,7 +670,7 @@ def main():
         ChatMemberHandler(on_bot_membership_change, ChatMemberHandler.MY_CHAT_MEMBER)
     )
 
-    logger.info("BUK Speaker Bot running build %s", SPEAKER_BUILD)
+    logger.info("BUK Speaker Bot running build %s with %d authorized admin(s)", SPEAKER_BUILD, len(ADMIN_USER_IDS))
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
