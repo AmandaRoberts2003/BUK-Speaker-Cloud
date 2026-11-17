@@ -715,35 +715,55 @@ def weather_heading(event, general=False):
 
 
 def weather_message(info):
-    """Only official, validated NWS fields; safe HTML formatting for Telegram."""
+    """Compact official NWS warning, with distinct emojis and blank-line spacing."""
     event = info["event"]
     heading = weather_heading(event, event in GENERAL_ADVISORY_EVENTS)
     area = info["area"]
     if len(area) > 250:
         area = area[:245].rsplit(";", 1)[0] + "; ... (see NWS alert)"
     fmt = lambda dt: dt.strftime("%b %d, %I:%M %p UTC")
-    lines = [f"<b>{heading}</b>",
-             f"{WEATHER_EMOJI.get(event, '⚠️')} <b>Hazard:</b> {html.escape(event)}",
-             f"📍 <b>Area:</b> {html.escape(area)}",
-             f"🕒 <b>NWS Alert Expires:</b> {fmt(info['expires'])}"]
+    hazard_icon = WEATHER_EMOJI.get(event, "🔎")
+    # Prevent duplicate emoji if the urgent/severe heading happens to use the
+    # same symbol as the weather hazard.
+    if hazard_icon in heading:
+        hazard_icon = "🔎"
+    lines = [
+        f"<b>{heading}</b>",
+        f"{hazard_icon} <b>Hazard:</b> {html.escape(event)}",
+        f"📍 <b>Affected Area:</b> {html.escape(area)}",
+        f"🕒 <b>Expires:</b> {fmt(info['expires'])}",
+    ]
     action = EVENT_ACTIONS.get(event)
     if action:
         lines.append(f"🚛 <b>Driver Action:</b> {html.escape(action)}")
     lines.append("<i>Source: National Weather Service</i>")
-    return "\n".join(lines)
+    return "\n\n".join(lines)
+
+
+# Curated icons: each sample uses distinct symbols for title, condition and
+# driver action. These are Unicode Telegram emojis, not external sticker files.
+PREVIEW_VISUALS = {
+    "snow": ("❄️ SNOW CONDITIONS ADVISORY", "🌨️", "🚛"),
+    "rain": ("🌧️ RAIN CONDITIONS ADVISORY", "💦", "🛞"),
+    "ice": ("🧊 ICY ROAD ADVISORY", "🛣️", "⚠️"),
+    "fog": ("🌫️ LOW VISIBILITY ADVISORY", "👁️", "💡"),
+    "wind": ("💨 WIND CONDITIONS ADVISORY", "🌬️", "🚚"),
+    "tornado": ("🚨 URGENT WEATHER ALERT", "🌪️", "🏠"),
+}
 
 
 def weather_preview_message(kind):
-    """Sample text only, private to admins; never a live alert."""
+    """Private examples only, always prominently labeled as non-live."""
     _, event, condition, action = PREVIEW_EXAMPLES[kind]
-    heading = ("🚨 URGENT WEATHER ALERT" if kind == "tornado"
-               else f"{PREVIEW_EMOJI[kind]} GENERAL WEATHER REMINDER")
-    return (f"🧪 <b>SAMPLE - NOT A LIVE ALERT</b>\n"
-            f"<b>{heading}</b>\n"
-            f"{PREVIEW_EMOJI[kind]} <b>Hazard:</b> {html.escape(event)}\n"
-            f"<b>Conditions:</b> {html.escape(condition)}\n"
-            f"🚛 <b>Driver Action:</b> {html.escape(action)}\n"
-            "<i>Preview for administrator approval only</i>")
+    heading, condition_icon, action_icon = PREVIEW_VISUALS[kind]
+    lines = [
+        "🧪 <b>SAMPLE - NOT A LIVE ALERT</b>",
+        f"<b>{heading}</b>",
+        f"{condition_icon} <b>Conditions:</b> {html.escape(condition)}",
+        f"{action_icon} <b>Driver Action:</b> {html.escape(action)}",
+        "<i>Preview for administrator approval only</i>",
+    ]
+    return "\n\n".join(lines)
 
 
 async def weatherpreview_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -963,7 +983,7 @@ async def weather_post_shutdown(app):
 
 
 
-SPEAKER_BUILD = "2026-11-17-weather-formatted-preview-v9"
+SPEAKER_BUILD = "2026-11-17-weather-spaced-preview-v10"
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
