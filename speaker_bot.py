@@ -3,6 +3,10 @@ import logging
 import os
 import re
 import sqlite3
+import json
+import urllib.request
+import urllib.parse
+from datetime import timedelta
 from datetime import datetime, timezone
 from contextlib import contextmanager
 
@@ -341,6 +345,25 @@ def init_database():
             conn.execute(
                 "ALTER TABLE groups ADD COLUMN welcome_sent INTEGER NOT NULL DEFAULT 1"
             )
+        conn.execute("""CREATE TABLE IF NOT EXISTS weather_locations (
+            chat_id INTEGER PRIMARY KEY,
+            latitude REAL NOT NULL,
+            longitude REAL NOT NULL,
+            assigned_at TEXT NOT NULL,
+            assigned_by INTEGER NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS weather_deliveries (
+            chat_id INTEGER NOT NULL,
+            alert_id TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            PRIMARY KEY (chat_id, alert_id)
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS weather_advisory_cooldown (
+            chat_id INTEGER NOT NULL,
+            event TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            PRIMARY KEY (chat_id, event)
+        )""")
         # Archive is shared by authorized admins; no Telegram private-chat access is granted.
         conn.execute("""CREATE TABLE IF NOT EXISTS announcements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -541,7 +564,378 @@ async def on_group_title_change(update: Update, context: ContextTypes.DEFAULT_TY
             conn.execute("UPDATE groups SET group_name = ? WHERE chat_id = ?", (title, update.effective_chat.id))
 
 
-SPEAKER_BUILD = "2026-11-17-admin-live-sharing-v6"
+# WEATHER PHASE 1: Official NWS point alerts only. No DOT, route, or Samsara
+# claims are made here. Driver delivery is OFF until explicitly enabled.
+# Two independent switches prevent accidental production notifications on upgrade.
+WEATHER_REQUESTED = os.getenv("WEATHER_ALERTS_ENABLED", "false").lower() == "true"
+WEATHER_TEMPLATES_APPROVED = os.getenv("WEATHER_TEMPLATES_APPROVED", "false").lower() == "true"
+WEATHER_ENABLED = WEATHER_REQUESTED and WEATHER_TEMPLATES_APPROVED
+WEATHER_POLL_SECONDS = max(120, int(os.getenv("WEATHER_POLL_SECONDS", "180")))
+# A manually supplied monitoring point expires quickly; it is NOT live GPS.
+WEATHER_POINT_TTL_HOURS = 6
+NWS_USER_AGENT = os.getenv("NWS_USER_AGENT", "BUKSpeakerWeather/1.0 (operations@example.com)")
+WEATHER_EVENTS = frozenset({
+    "Tornado Warning", "Flash Flood Warning", "Severe Thunderstorm Warning",
+    "Blizzard Warning", "Winter Storm Warning", "Ice Storm Warning",
+    "Snow Squall Warning", "High Wind Warning", "Extreme Wind Warning",
+    "Dust Storm Warning", "Flood Warning", "Hurricane Warning",
+    "Tropical Storm Warning", "Red Flag Warning",
+    # Only official NWS advisories with a clear, verifiable hazard.
+    "Winter Weather Advisory", "Wind Advisory", "Dense Fog Advisory",
+    "Freezing Fog Advisory", "Flood Advisory", "Heat Advisory",
+    "Cold Weather Advisory", "Extreme Cold Warning", "Extreme Heat Warning",
+})
+
+GENERAL_ADVISORY_EVENTS = frozenset({
+    "Winter Weather Advisory", "Wind Advisory", "Dense Fog Advisory",
+    "Freezing Fog Advisory", "Flood Advisory", "Heat Advisory",
+    "Cold Weather Advisory",
+})
+
+# Driver messages use only event-specific, conservative guidance.
+EVENT_ACTIONS = {
+    "Tornado Warning": "Seek sturdy indoor shelter immediately. Do not shelter beneath an overpass.",
+    "Flash Flood Warning": "Do not drive through floodwater. Find a safe route or stop and contact Dispatch.",
+    "Blizzard Warning": "Avoid travel in whiteout conditions. Stop at a safe location if conditions are unsafe.",
+    "Winter Storm Warning": "Check road conditions and stop safely if visibility or traction becomes unsafe.",
+    "Ice Storm Warning": "Avoid unnecessary travel and use extreme caution on icy roads.",
+    "Snow Squall Warning": "Avoid entering the affected roadway during sudden whiteout conditions.",
+    "High Wind Warning": "Use caution in crosswinds, especially with an empty or lightly loaded trailer.",
+    "Severe Thunderstorm Warning": "Watch for damaging winds and hail; stop safely if conditions become hazardous.",
+    "Dust Storm Warning": "If visibility collapses, leave the roadway safely; avoid stopping in travel lanes.",
+    "Winter Weather Advisory": "Reduce speed and allow extra stopping distance if roads become slick.",
+    "Wind Advisory": "Use caution on exposed roads, especially with high-profile or empty trailers.",
+    "Dense Fog Advisory": "Slow down, increase following distance, and use appropriate lights.",
+    "Freezing Fog Advisory": "Watch for slick bridges and reduced visibility; adjust speed accordingly.",
+    "Flood Advisory": "Avoid flooded roads. Do not drive through standing water.",
+    "Heat Advisory": "Stay hydrated and monitor for heat-related illness during stops and inspections.",
+    "Cold Weather Advisory": "Use appropriate cold-weather precautions during stops and inspections.",
+    "Extreme Cold Warning": "Limit outdoor exposure and use appropriate cold-weather precautions.",
+    "Extreme Heat Warning": "Limit outdoor heat exposure and monitor for signs of heat illness.",
+}
+
+# These are illustrative templates for private admin preview; never represented as
+# a live, verified warning or automatically sent on their own.
+PREVIEW_EXAMPLES = {
+    "snow": ("GENERAL WEATHER REMINDER", "Snow", "Snow may reduce traction and visibility.",
+             "Reduce speed, increase following distance, and avoid sudden braking."),
+    "rain": ("GENERAL WEATHER REMINDER", "Rain", "Wet roads may increase stopping distances.",
+             "Adjust speed and following distance; avoid sudden steering or braking."),
+    "ice": ("GENERAL WEATHER REMINDER", "Ice", "Icy conditions may affect bridges and overpasses.",
+            "Use caution, avoid sudden maneuvers, and stop safely if needed."),
+    "fog": ("GENERAL WEATHER REMINDER", "Fog", "Reduced visibility may affect road safety.",
+            "Slow down, increase following distance, and use appropriate lights."),
+    "wind": ("GENERAL WEATHER REMINDER", "Wind", "Crosswinds may affect high-profile vehicles.",
+             "Use caution, especially with empty or lightly loaded trailers."),
+    "tornado": ("URGENT WEATHER ALERT", "Tornado Warning", "Official tornado warning affects your location.",
+                EVENT_ACTIONS["Tornado Warning"]),
+}
+
+
+
+def weather_parse_time(value):
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def weather_active_record(feature, now=None):
+    """Validate live, actual NWS warning; do not infer hazards or severity."""
+    now = now or datetime.now(timezone.utc)
+    props = feature.get("properties", {})
+    if not isinstance(props, dict):
+        return None
+    if props.get("status", "").lower() != "actual":
+        return None
+    if props.get("messageType", "").lower() == "cancel":
+        return None
+    event = props.get("event")
+    if event not in WEATHER_EVENTS:
+        return None
+    # expires refers to the NWS alert product, not necessarily the hazard end.
+    expires = weather_parse_time(props.get("expires"))
+    starts = weather_parse_time(props.get("onset") or props.get("effective"))
+    if not expires or expires <= now or not starts:
+        return None
+    area = props.get("areaDesc")
+    alert_id = props.get("id") or feature.get("id")
+    if not isinstance(area, str) or not area.strip() or not alert_id:
+        return None
+    return {
+        "id": str(alert_id), "event": event, "area": area.strip(),
+        "starts": starts, "expires": expires,
+        "severity": str(props.get("severity") or "Unspecified"),
+        "instruction": str(props.get("instruction") or "").strip(),
+    }
+
+
+def nws_get_active_point(latitude, longitude):
+    """Blocking official NWS request; invoked with asyncio.to_thread."""
+    query = urllib.parse.urlencode({"point": f"{latitude:.4f},{longitude:.4f}"})
+    url = f"https://api.weather.gov/alerts/active?{query}"
+    request = urllib.request.Request(url, headers={
+        "Accept": "application/geo+json", "User-Agent": NWS_USER_AGENT,
+    })
+    with urllib.request.urlopen(request, timeout=18) as response:
+        data = json.load(response)
+    if not isinstance(data, dict) or not isinstance(data.get("features"), list):
+        raise ValueError("Unexpected NWS response; do not broadcast")
+    return data["features"]
+
+
+def weather_message(info):
+    """Concise, source-backed driver notification, with no invented conditions."""
+    fmt = lambda dt: dt.strftime("%b %d, %I:%M %p UTC")
+    event = info["event"]
+    general = event in GENERAL_ADVISORY_EVENTS
+    heading = ("WEATHER ADVISORY" if general else
+               "URGENT WEATHER ALERT" if event in {"Tornado Warning", "Flash Flood Warning", "Snow Squall Warning"} else
+               "SEVERE WEATHER ALERT")
+    # NWS areas sometimes list dozens of counties. Keep the official area text,
+    # but avoid sending an ambiguous partial county name if very long.
+    area = info["area"]
+    if len(area) > 250:
+        area = area[:245].rsplit(";", 1)[0] + "; ... (see NWS alert)"
+    lines = [heading,
+             f"Hazard: {event}",
+             f"Area: {area}",
+             f"NWS alert expires: {fmt(info['expires'])}"]
+    if event in EVENT_ACTIONS:
+        lines.append(f"Safety action: {EVENT_ACTIONS[event]}")
+    lines.append("Source: National Weather Service")
+    return "\n".join(lines)
+
+
+def weather_preview_message(kind):
+    """Static private-chat examples; never masquerade as actual live data."""
+    heading, event, condition, action = PREVIEW_EXAMPLES[kind]
+    return (f"[SAMPLE - NOT A LIVE ALERT]\n{heading}\n"
+            f"Hazard: {event}\n"
+            f"Conditions: {condition}\n"
+            f"Safety action: {action}\n"
+            "Source: Example wording for administrator approval")
+
+
+async def weatherpreview_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Never broadcasts; previews every alert style in the admin's private chat."""
+    if not is_admin(update) or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    kind = context.args[0].lower() if context.args else "all"
+    if kind != "all" and kind not in PREVIEW_EXAMPLES:
+        await update.effective_message.reply_text(
+            "Usage: /weatherpreview [all|snow|rain|ice|fog|wind|tornado]")
+        return
+    keys = list(PREVIEW_EXAMPLES) if kind == "all" else [kind]
+    for name in keys:
+        await update.effective_message.reply_text(weather_preview_message(name),
+                                                  disable_web_page_preview=True)
+
+
+async def weathercheck_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Fetch REAL current NWS alerts for a supplied point, admin PRIVATE preview only.
+
+    Never sends anything to a driver group and never saves a monitoring point.
+    """
+    if not is_admin(update) or update.effective_chat.type != ChatType.PRIVATE:
+        return
+    if len(context.args) != 2:
+        await update.effective_message.reply_text("Usage: /weathercheck LATITUDE LONGITUDE (private preview only)")
+        return
+    try:
+        lat, lon = [float(x) for x in context.args]
+        if not 18 <= lat <= 72 or not -180 <= lon <= -60:
+            raise ValueError("Out of supported US bounds")
+    except ValueError:
+        await update.effective_message.reply_text("Invalid coordinates. Nothing sent.")
+        return
+    try:
+        features = await asyncio.to_thread(nws_get_active_point, lat, lon)
+    except Exception:
+        logger.exception("NWS preview lookup failed")
+        await update.effective_message.reply_text("NWS data unavailable. No alert sent.")
+        return
+    items = [item for feature in features
+             if (item := weather_active_record(feature)) is not None]
+    if not items:
+        await update.effective_message.reply_text(
+            "No qualifying active NWS alerts for this point right now. No group messages sent.")
+        return
+    await update.effective_message.reply_text(
+        f"PRIVATE PREVIEW | {len(items)} qualifying active NWS alert(s). Nothing sent to groups.")
+    for item in items[:8]:
+        await update.effective_message.reply_text(weather_message(item),
+                                                 disable_web_page_preview=True)
+    if len(items) > 8:
+        await update.effective_message.reply_text(f"{len(items)-8} additional alerts omitted from preview.")
+
+
+def weather_location_recent(assigned_at, now):
+    assigned = weather_parse_time(assigned_at)
+    return bool(assigned and assigned <= now and now - assigned < timedelta(hours=WEATHER_POINT_TTL_HOURS))
+
+
+async def weatherpoint_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin explicitly assigns a TEMPORARY monitoring coordinate to one group.
+
+    This is NOT a truck location integration and must be updated when the truck moves.
+    """
+    if not is_admin(update) or not is_group_chat(update):
+        await update.effective_message.reply_text("Use /weatherpoint in a driver group as an authorized BUK Speaker admin.")
+        return
+    if len(context.args) != 2:
+        await update.effective_message.reply_text("Usage: /weatherpoint LATITUDE LONGITUDE (valid for 6 hours)")
+        return
+    try:
+        lat, lon = [float(x) for x in context.args]
+        if not 18 <= lat <= 72 or not -180 <= lon <= -60:
+            raise ValueError("Outside supported US monitoring bounds")
+    except ValueError:
+        await update.effective_message.reply_text("Invalid US latitude/longitude. No monitoring location saved.")
+        return
+    chat = await get_live_group(update.effective_chat.id, context)
+    if not chat or not chat.title or is_inactive_group_name(chat.title):
+        await update.effective_message.reply_text("Location not saved: active group could not be verified.")
+        return
+    with get_connection() as conn:
+        conn.execute("""INSERT INTO weather_locations (chat_id, latitude, longitude, assigned_at, assigned_by)
+            VALUES (?, ?, ?, ?, ?) ON CONFLICT(chat_id) DO UPDATE SET
+            latitude=excluded.latitude, longitude=excluded.longitude,
+            assigned_at=excluded.assigned_at, assigned_by=excluded.assigned_by""",
+            (chat.id, lat, lon, datetime.now(timezone.utc).isoformat(), update.effective_user.id))
+    await update.effective_message.reply_text(
+        "Temporary NWS monitoring point saved for 6 hours. This is a manually assigned point, "
+        "not live truck GPS. No alerts will be sent until BOTH weather approval switches are enabled."
+    )
+
+
+async def weatheroff_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update) or not is_group_chat(update):
+        return
+    with get_connection() as conn:
+        conn.execute("DELETE FROM weather_locations WHERE chat_id=?", (update.effective_chat.id,))
+    await update.effective_message.reply_text("Weather monitoring disabled for this group.")
+
+
+async def weatherstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    with get_connection() as conn:
+        rows = conn.execute("SELECT chat_id, assigned_at FROM weather_locations").fetchall()
+    now = datetime.now(timezone.utc)
+    valid = sum(weather_location_recent(item[1], now) for item in rows)
+    await update.effective_message.reply_text(
+        f"NWS weather engine: {'ON' if WEATHER_ENABLED else 'OFF (approval required)'}\n"
+        f"Manually assigned monitoring points: {len(rows)}\n"
+        f"Points within 6-hour validity: {valid}\n"
+        "Automatic group alerts require WEATHER_ALERTS_ENABLED=true AND "
+        "WEATHER_TEMPLATES_APPROVED=true. Rain/snow general reminders are preview-only; "
+        "official NWS advisories can be automated once approved. "
+        "DOT, Samsara, and routes are not connected."
+    )
+
+
+async def weather_scan(context):
+    """No group messaging unless enabled, location fresh, verified live active title.
+
+    Fail closed on data/API errors. Only send NWS actual active warnings to
+    deliberately configured, non-stale group points. Dedup persisted in SQLite.
+    """
+    if not WEATHER_ENABLED:
+        return
+    now = datetime.now(timezone.utc)
+    with get_connection() as conn:
+        points = conn.execute("""SELECT g.chat_id, w.latitude, w.longitude, w.assigned_at
+            FROM groups g JOIN weather_locations w ON w.chat_id=g.chat_id""").fetchall()
+    # One fetch per distinct coordinate to reduce official endpoint load.
+    fetched = {}
+    for chat_id, lat, lon, assigned_at in points:
+        if not weather_location_recent(assigned_at, now):
+            continue
+        live = await get_live_group(chat_id, context)
+        if live is None or not live.title or is_inactive_group_name(live.title):
+            continue
+        key = (round(lat, 4), round(lon, 4))
+        if key not in fetched:
+            try:
+                fetched[key] = await asyncio.to_thread(nws_get_active_point, *key)
+            except Exception:
+                logger.exception("NWS request failed for monitored coordinate; group alert skipped")
+                fetched[key] = []
+        for feature in fetched[key]:
+            item = weather_active_record(feature, now)
+            if not item:
+                continue
+            with get_connection() as conn:
+                delivered = conn.execute(
+                    "SELECT 1 FROM weather_deliveries WHERE chat_id=? AND alert_id=?",
+                    (chat_id, item["id"])).fetchone()
+            if delivered:
+                continue
+            # General advisories: never repeat the same hazard for a group
+            # more often than every 12 hours, even if NWS refreshes its ID.
+            # New severe warnings are not silenced by advisory cooldowns.
+            if item["event"] in GENERAL_ADVISORY_EVENTS:
+                with get_connection() as conn:
+                    cooldown = conn.execute(
+                        "SELECT sent_at FROM weather_advisory_cooldown WHERE chat_id=? AND event=?",
+                        (chat_id, item["event"])).fetchone()
+                if cooldown:
+                    prior = weather_parse_time(cooldown[0])
+                    if prior and now - prior < timedelta(hours=12):
+                        continue
+            # Last check immediately before sending in case admins renamed group.
+            latest = await get_live_group(chat_id, context)
+            if latest is None or not latest.title or is_inactive_group_name(latest.title):
+                break
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=weather_message(item),
+                                               disable_web_page_preview=True)
+            except TelegramError:
+                logger.exception("NWS alert delivery failed for chat %s", chat_id)
+                continue
+            with get_connection() as conn:
+                conn.execute("INSERT OR IGNORE INTO weather_deliveries (chat_id, alert_id, sent_at) VALUES (?, ?, ?)",
+                             (chat_id, item["id"], now.isoformat()))
+                if item["event"] in GENERAL_ADVISORY_EVENTS:
+                    conn.execute("""INSERT INTO weather_advisory_cooldown (chat_id, event, sent_at)
+                        VALUES (?, ?, ?) ON CONFLICT(chat_id, event) DO UPDATE SET
+                        sent_at=excluded.sent_at""",
+                        (chat_id, item["event"], now.isoformat()))
+            await asyncio.sleep(0.07)
+
+
+async def weather_loop(app):
+    while True:
+        try:
+            await weather_scan(app)
+        except Exception:
+            logger.exception("Weather monitor failed; no unverified notices sent")
+        await asyncio.sleep(WEATHER_POLL_SECONDS)
+
+
+async def weather_post_init(app):
+    if WEATHER_ENABLED:
+        app.bot_data["weather_task"] = asyncio.create_task(weather_loop(app))
+        logger.info("Official NWS monitoring enabled, interval %ss", WEATHER_POLL_SECONDS)
+    else:
+        logger.info("Official NWS monitoring OFF until explicitly enabled")
+
+
+async def weather_post_shutdown(app):
+    task = app.bot_data.get("weather_task")
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+
+SPEAKER_BUILD = "2026-11-17-weather-template-preview-v8"
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -554,6 +948,7 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Media broadcasting: enabled\n"
         "Shared announcement history: enabled\n"
         "Automatic admin broadcast sharing: enabled\n"
+        f"NWS weather monitoring: {'ON' if WEATHER_ENABLED else 'OFF (safe default)'}\n"
         f"Authorized admins: {len(ADMIN_USER_IDS)}"
     )
 
@@ -794,7 +1189,8 @@ def main():
         raise RuntimeError("BOT_TOKEN is missing. Set it in your cloud host's environment variables.")
 
     init_database()
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (Application.builder().token(BOT_TOKEN)
+           .post_init(weather_post_init).post_shutdown(weather_post_shutdown).build())
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(interactive_menu))
@@ -804,6 +1200,11 @@ def main():
     app.add_handler(CommandHandler("retrywelcome", retrywelcome))
     app.add_handler(CommandHandler("broadcast", broadcast))
     app.add_handler(CommandHandler("version", version_command))
+    app.add_handler(CommandHandler("weatherpoint", weatherpoint_command))
+    app.add_handler(CommandHandler("weatheroff", weatheroff_command))
+    app.add_handler(CommandHandler("weatherstatus", weatherstatus_command))
+    app.add_handler(CommandHandler("weatherpreview", weatherpreview_command))
+    app.add_handler(CommandHandler("weathercheck", weathercheck_command))
     app.add_handler(CommandHandler("history", history_command))
     app.add_handler(CommandHandler("announcement", announcement_command))
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_TITLE, on_group_title_change))
