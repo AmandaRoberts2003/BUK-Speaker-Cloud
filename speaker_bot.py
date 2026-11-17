@@ -541,7 +541,7 @@ async def on_group_title_change(update: Update, context: ContextTypes.DEFAULT_TY
             conn.execute("UPDATE groups SET group_name = ? WHERE chat_id = ?", (title, update.effective_chat.id))
 
 
-SPEAKER_BUILD = "2026-11-17-admin-shared-history-v5"
+SPEAKER_BUILD = "2026-11-17-admin-live-sharing-v6"
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -553,6 +553,7 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Inactive-group check: enabled (live Telegram group titles)\n"
         "Media broadcasting: enabled\n"
         "Shared announcement history: enabled\n"
+        "Automatic admin broadcast sharing: enabled\n"
         f"Authorized admins: {len(ADMIN_USER_IDS)}"
     )
 
@@ -684,20 +685,40 @@ async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await command_message.reply_text(f"Announcement #{announcement_id}\n\n{report}")
 
-    # Telegram allows private DMs only after a recipient has started the bot.
-    # Notification failures must never change the completed delivery result.
-    for other_admin_id in ADMIN_USER_IDS - {update.effective_user.id}:
+    # Share each announcement itself with every other admin immediately after
+    # the broadcast finishes, followed by the full delivery report. They do
+    # not have to request /history or /announcement for new broadcasts.
+    # Telegram requires admins to have opened and started the bot first.
+    for other_admin_id in sorted(ADMIN_USER_IDS - {update.effective_user.id}):
         try:
             await context.bot.send_message(
                 chat_id=other_admin_id,
-                text=(f"📢 New BUK Speaker announcement #{announcement_id}\n"
-                      f"From admin ID: {update.effective_user.id}\n"
-                      f"Date: {created_at}\n\n"
-                      f"Use /announcement {announcement_id} to review the announcement.\n\n"
-                      + report),
+                text=(f"📢 BUK Speaker — announcement #{announcement_id}\n"
+                      f"Sent by admin ID: {update.effective_user.id}\n"
+                      f"Date: {created_at}\n"
+                      "Announcement copy:"),
+            )
+            if media_message:
+                await context.bot.copy_message(
+                    chat_id=other_admin_id,
+                    from_chat_id=source_message.chat_id,
+                    message_id=source_message.message_id,
+                )
+            else:
+                # Telegram limits sendMessage text to 4096 characters.
+                for offset in range(0, len(broadcast_text), 3500):
+                    await context.bot.send_message(
+                        chat_id=other_admin_id,
+                        text=broadcast_text[offset:offset + 3500],
+                    )
+            await context.bot.send_message(
+                chat_id=other_admin_id,
+                text=f"📊 Delivery results for announcement #{announcement_id}\n\n{report}"
             )
         except TelegramError:
-            logger.warning("Could not privately notify admin ID %s; ask them to send /start", other_admin_id)
+            # An admin may have blocked the bot, not pressed Start yet, or a
+            # copy may fail. Never change the driver delivery counts.
+            logger.exception("Could not share announcement #%s with admin %s", announcement_id, other_admin_id)
 
 
 async def history_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
