@@ -393,6 +393,16 @@ def init_database():
             vehicle_id TEXT NOT NULL,
             status TEXT NOT NULL
         )""")
+        # Separate private monitoring log. Only an authenticated admin may read results.
+        # Unique key persists across restarts and prevents repeated notifications.
+        conn.execute("""CREATE TABLE IF NOT EXISTS weather_admin_notifications (
+            admin_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            alert_id TEXT NOT NULL,
+            event TEXT NOT NULL,
+            delivered_at TEXT NOT NULL,
+            PRIMARY KEY(admin_id, chat_id, alert_id)
+        )""")
         # Archive is shared by authorized admins; no Telegram private-chat access is granted.
         conn.execute("""CREATE TABLE IF NOT EXISTS announcements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1639,6 +1649,178 @@ async def weather_scan(context):
             await asyncio.sleep(0.07)
 
 
+# V16: PRIVATE administrator monitoring of verified Samsara truck locations.
+# This is INDEPENDENT from the old, hard-disabled driver weather delivery path.
+# The private automatic monitor is opt-in via FadeHost; manual /weatheradminscan
+# is also private, and can be tested before enabling scheduled scans.
+WEATHER_ADMIN_MONITOR_ENABLED = os.getenv("WEATHER_ADMIN_MONITOR_ENABLED", "false").lower() == "true"
+WEATHER_ADMIN_SCAN_SECONDS = max(300, int(os.getenv("WEATHER_ADMIN_SCAN_SECONDS", "600")))
+WEATHER_ADMIN_MAX_GROUPS_PER_SCAN = max(1, min(100, int(os.getenv("WEATHER_ADMIN_MAX_GROUPS_PER_SCAN", "60"))))
+
+
+def _recent_admin_alert(conn, chat_id, event, now):
+    """Avoid noise from NWS refreshes with new IDs during an active episode.
+
+    Different hazard events are independent. A 6-hour quiet window applies to
+    non-emergency events. Critical warnings are never blocked by this cooldown;
+    the exact alert ID is still deduplicated separately.
+    """
+    if event in {"Tornado Warning", "Flash Flood Warning", "Snow Squall Warning", "Extreme Wind Warning"}:
+        return False
+    row = conn.execute(
+        """SELECT MAX(delivered_at) FROM weather_admin_notifications
+           WHERE chat_id=? AND event=?""", (chat_id, event)
+    ).fetchone()
+    last = weather_parse_time(row[0]) if row and row[0] else None
+    return bool(last and timedelta(0) <= now-last < timedelta(hours=6))
+
+
+async def run_weather_admin_scan(app):
+    """Observe only, NEVER post to a driver group. Fail closed on uncertain data."""
+    summary = {"checked": 0, "fresh": 0, "stale": 0, "inactive": 0,
+               "unverified": 0, "alerts": 0, "admin_messages": 0,
+               "nws_failed": 0, "duplicate": 0, "error": None, "limited": 0}
+    lock = app.bot_data.setdefault("weather_admin_scan_lock", asyncio.Lock())
+    if lock.locked():
+        summary["error"] = "Scan already running"
+        return summary
+    async with lock:
+        if not SAMSARA_API_TOKEN:
+            summary["error"] = "Samsara token not configured"
+            return summary
+        try:
+            vehicles = await asyncio.to_thread(samsara_get_gps_snapshot)
+        except Exception as exc:
+            logger.warning("Private NWS scan skipped: Samsara %s", type(exc).__name__)
+            summary["error"] = "Samsara GPS snapshot unavailable"
+            return summary
+        with get_connection() as conn:
+            links = conn.execute("SELECT chat_id, vehicle_id FROM samsara_group_links ORDER BY chat_id").fetchall()
+        # Enforce pilot API budget. Don't imply that unscanned groups were checked.
+        summary["limited"] = max(0, len(links)-WEATHER_ADMIN_MAX_GROUPS_PER_SCAN)
+        links = links[:WEATHER_ADMIN_MAX_GROUPS_PER_SCAN]
+        now = datetime.now(timezone.utc)
+        for chat_id, vehicle_id in links:
+            summary["checked"] += 1
+            live = await get_live_group(chat_id, app)
+            if not live or live.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or not live.title:
+                summary["unverified"] += 1
+                continue
+            if is_inactive_group_name(live.title):
+                summary["inactive"] += 1
+                continue
+            record = vehicles.get(str(vehicle_id))
+            if not record or group_unit_from_title(live.title) != vehicle_unit_from_name(record.get("name")):
+                summary["unverified"] += 1
+                continue
+            valid_gps = samsara_valid_gps(record.get("gps"), now=now)
+            if valid_gps is None:
+                summary["stale"] += 1
+                continue
+            summary["fresh"] += 1
+            lat, lon, _ = valid_gps
+            try:
+                features = await asyncio.to_thread(nws_get_active_point, lat, lon)
+            except Exception as exc:
+                logger.warning("Private NWS lookup unavailable (group %s; %s)", chat_id, type(exc).__name__)
+                summary["nws_failed"] += 1
+                continue
+            warnings = [item for feature in features if (item := weather_active_record(feature, now=now)) is not None]
+            for item in warnings:
+                # Unique warning + exact vehicle/group + official NWS alert ID.
+                # Per-event cooldown limits revised IDs and excessive repetition.
+                with get_connection() as conn:
+                    exact_seen = conn.execute("SELECT 1 FROM weather_admin_notifications WHERE chat_id=? AND alert_id=? LIMIT 1",
+                                              (chat_id, item["id"])).fetchone()
+                    suppressed = _recent_admin_alert(conn, chat_id, item["event"], now)
+                if exact_seen or suppressed:
+                    summary["duplicate"] += 1
+                    continue
+                summary["alerts"] += 1
+                # Fetch a timezone only if there is a new qualifying warning.
+                try:
+                    tz = await asyncio.to_thread(nws_get_point_timezone, lat, lon)
+                except Exception:
+                    tz = None  # Explicit UTC fallback, never guess.
+                messages = weather_message_parts(item, unit=record.get("name"), timezone_name=tz)
+                heading = ("🔒 PRIVATE WEATHER MONITOR — NOT SENT TO DRIVERS\n"
+                           f"Group: {html.escape(live.title)}\n"
+                           f"Truck: {html.escape(str(record.get('name') or vehicle_id))}\n\n")
+                for admin in sorted(ADMIN_USER_IDS):
+                    # Don't re-send to an admin already notified, even on retries.
+                    with get_connection() as conn:
+                        already = conn.execute("SELECT 1 FROM weather_admin_notifications WHERE admin_id=? AND chat_id=? AND alert_id=?",
+                                               (admin, chat_id, item["id"])).fetchone()
+                    if already:
+                        continue
+                    try:
+                        await app.bot.send_message(chat_id=admin, text=heading, parse_mode="HTML")
+                        for part in messages:
+                            await app.bot.send_message(chat_id=admin, text=part, parse_mode="HTML",
+                                                       disable_web_page_preview=True)
+                    except TelegramError as exc:
+                        logger.warning("Weather private admin notification failed for admin %s (%s)", admin, type(exc).__name__)
+                        continue
+                    # Mark after successful delivery. No driver group messaging exists in this function.
+                    with get_connection() as conn:
+                        conn.execute("""INSERT OR IGNORE INTO weather_admin_notifications
+                            (admin_id,chat_id,alert_id,event,delivered_at) VALUES (?,?,?,?,?)""",
+                            (admin, chat_id, item["id"], item["event"], now.isoformat()))
+                    summary["admin_messages"] += 1
+            await asyncio.sleep(0.15)  # Conservative NWS request pacing.
+        app.bot_data["weather_admin_last_scan"] = datetime.now(timezone.utc).isoformat()
+        app.bot_data["weather_admin_last_result"] = summary.copy()
+        return summary
+
+
+async def weather_admin_loop(app):
+    while True:
+        try:
+            await run_weather_admin_scan(app)
+        except Exception:
+            logger.exception("Private weather monitoring cycle failed; drivers unaffected")
+        await asyncio.sleep(WEATHER_ADMIN_SCAN_SECONDS)
+
+
+async def weatheradminstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not samsara_private_admin(update):
+        return
+    with get_connection() as conn:
+        linked = conn.execute("SELECT COUNT(*) FROM samsara_group_links").fetchone()[0]
+        tracked = conn.execute("SELECT COUNT(*) FROM weather_admin_notifications").fetchone()[0]
+    result = context.application.bot_data.get("weather_admin_last_result") or {}
+    await update.effective_message.reply_text(
+        f"Private weather monitoring: {'ON' if WEATHER_ADMIN_MONITOR_ENABLED else 'OFF (manual scan available)'}\n"
+        f"Linked truck groups: {linked}\n"
+        f"Scan interval: {WEATHER_ADMIN_SCAN_SECONDS//60} minutes\n"
+        f"Pilot scan limit: {WEATHER_ADMIN_MAX_GROUPS_PER_SCAN} groups/cycle\n"
+        f"Administrator alert records: {tracked}\n"
+        f"Last scan: {context.application.bot_data.get('weather_admin_last_scan', 'none')}\n"
+        f"Last result: {result or 'none'}\n"
+        "Weather messages to driver groups: OFF (hard-disabled)."
+    )
+
+
+async def weatheradminscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not samsara_private_admin(update):
+        return
+    await update.effective_message.reply_text(
+        "Starting private linked-truck weather scan. No messages to driver groups.")
+    summary = await run_weather_admin_scan(context.application)
+    await update.effective_message.reply_text(
+        "PRIVATE WEATHER SCAN RESULT\n"
+        f"Linked groups checked: {summary['checked']}\n"
+        f"Fresh GPS: {summary['fresh']} | Stale/missing GPS: {summary['stale']}\n"
+        f"Inactive skipped: {summary['inactive']} | Unverified: {summary['unverified']}\n"
+        f"NWS request failures: {summary['nws_failed']}\n"
+        f"New qualifying alerts: {summary['alerts']} | Duplicates suppressed: {summary['duplicate']}\n"
+        f"Administrator copies delivered: {summary['admin_messages']}\n"
+        f"Not scanned (pilot limit): {summary['limited']}\n"
+        f"Status: {summary['error'] or 'Complete'}\n"
+        "Driver-group weather notifications: OFF."
+    )
+
+
 async def weather_loop(app):
     while True:
         try:
@@ -1652,6 +1834,9 @@ async def weather_post_init(app):
     if SAMSARA_AUTO_ONBOARD_ENABLED:
         app.bot_data["samsara_auto_task"] = asyncio.create_task(samsara_auto_loop(app))
         logger.info("Samsara automatic group matching enabled, interval %ss", SAMSARA_AUTO_SCAN_SECONDS)
+    if WEATHER_ADMIN_MONITOR_ENABLED:
+        app.bot_data["weather_admin_task"] = asyncio.create_task(weather_admin_loop(app))
+        logger.info("Private Samsara/NWS monitor enabled; interval %s seconds", WEATHER_ADMIN_SCAN_SECONDS)
     if WEATHER_ENABLED:
         app.bot_data["weather_task"] = asyncio.create_task(weather_loop(app))
         logger.info("Official NWS monitoring enabled, interval %ss", WEATHER_POLL_SECONDS)
@@ -1660,7 +1845,7 @@ async def weather_post_init(app):
 
 
 async def weather_post_shutdown(app):
-    for name in ("samsara_auto_task", "weather_task"):
+    for name in ("samsara_auto_task", "weather_admin_task", "weather_task"):
         task = app.bot_data.get(name)
         if task:
             task.cancel()
@@ -1671,7 +1856,7 @@ async def weather_post_shutdown(app):
 
 
 
-SPEAKER_BUILD = "2026-11-18-auto-samsara-onboarding-v15"
+SPEAKER_BUILD = "2026-11-18-private-weather-monitor-v16"
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1687,6 +1872,7 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"NWS weather monitoring: {'ON' if WEATHER_ENABLED else 'OFF (safe default)'}\n"
         f"Authorized admins: {len(ADMIN_USER_IDS)}\n"
         f"Samsara auto-onboarding: {'ON' if SAMSARA_AUTO_ONBOARD_ENABLED else 'OFF'}\n"
+        f"Samsara private weather monitoring: {'ON' if WEATHER_ADMIN_MONITOR_ENABLED else 'OFF (manual scan available)'}\n"
         "Samsara weather delivery: PRIVATE PREVIEW ONLY"
     )
 
@@ -1942,6 +2128,8 @@ def main():
     app.add_handler(CommandHandler("samsaraunits", samsaraunits_command))
     app.add_handler(CommandHandler("samsaraautostatus", samsaraautostatus_command))
     app.add_handler(CommandHandler("samsaraautoscan", samsaraautoscan_command))
+    app.add_handler(CommandHandler("weatheradminstatus", weatheradminstatus_command))
+    app.add_handler(CommandHandler("weatheradminscan", weatheradminscan_command))
     app.add_handler(CommandHandler("samsaramatchpreview", samsaramatchpreview_command))
     app.add_handler(CommandHandler("samsaramatchconfirm", samsaramatchconfirm_command))
     app.add_handler(CommandHandler("samsaralink", samsaralink_command))
