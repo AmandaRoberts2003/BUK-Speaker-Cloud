@@ -1035,6 +1035,11 @@ EVENT_ACTIONS = {
     "Cold Weather Advisory": "Use appropriate cold-weather precautions during stops and inspections.",
     "Extreme Cold Warning": "Limit outdoor exposure and use appropriate cold-weather precautions.",
     "Extreme Heat Warning": "Limit outdoor heat exposure and monitor for signs of heat illness.",
+    "Red Flag Warning": "Avoid parking on dry vegetation; follow local fire restrictions and report smoke or fire.",
+    "Flood Warning": "Do not drive through flooded roads. Check road closures before proceeding.",
+    "Extreme Wind Warning": "Avoid travel in dangerous winds and seek safe shelter as instructed by authorities.",
+    "Hurricane Warning": "Avoid affected routes; follow official evacuation and road closure instructions.",
+    "Tropical Storm Warning": "Monitor official road closures and stop safely if wind or flooding becomes hazardous.",
 }
 
 # These are illustrative templates for private admin preview; never represented as
@@ -1140,9 +1145,16 @@ def weather_message(info):
     """Compact official NWS warning, with distinct emojis and blank-line spacing."""
     event = info["event"]
     heading = weather_heading(event, event in GENERAL_ADVISORY_EVENTS)
-    area = info["area"]
-    if len(area) > 250:
-        area = area[:245].rsplit(";", 1)[0] + "; ... (see NWS alert)"
+    # NWS areaDesc can list dozens of counties and forecast zones. Keep the
+    # message readable without falsely claiming one county is the truck's county.
+    areas = [part.strip() for part in info["area"].split(";") if part.strip()]
+    if not areas:
+        areas = [info["area"].strip()]
+    area = "; ".join(areas[:2])
+    if len(areas) > 2:
+        area += f" (+{len(areas) - 2} other NWS areas)"
+    if len(area) > 170:
+        area = area[:166].rsplit(" ", 1)[0] + "..."
     fmt = lambda dt: dt.strftime("%b %d, %I:%M %p UTC")
     hazard_icon = WEATHER_EMOJI.get(event, "🔎")
     # Prevent duplicate emoji if the urgent/severe heading happens to use the
@@ -1152,7 +1164,7 @@ def weather_message(info):
     lines = [
         f"<b>{heading}</b>",
         f"{hazard_icon} <b>Hazard:</b> {html.escape(event)}",
-        f"📍 <b>Affected Area:</b> {html.escape(area)}",
+        f"📍 <b>NWS Region:</b> {html.escape(area)}",
         f"🕒 <b>Expires:</b> {fmt(info['expires'])}",
     ]
     action = EVENT_ACTIONS.get(event)
@@ -1405,7 +1417,7 @@ async def weather_post_shutdown(app):
 
 
 
-SPEAKER_BUILD = "2026-11-18-samsara-match-review-v12"
+SPEAKER_BUILD = "2026-11-18-weather-alert-refinement-v13"
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
