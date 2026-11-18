@@ -6,6 +6,7 @@ import re
 import sqlite3
 import json
 import urllib.request
+import urllib.error
 import urllib.parse
 from datetime import timedelta
 from datetime import datetime, timezone
@@ -637,11 +638,30 @@ async def samsara_snapshot_or_error(update):
         return None
     try:
         return await asyncio.to_thread(samsara_get_gps_snapshot)
-    except Exception as error:
-        # Avoid logging raw HTTP request objects, which could contain tokens.
-        logger.warning("Samsara snapshot unavailable (%s)", type(error).__name__)
+    except urllib.error.HTTPError as error:
+        # Never log the request, URL, response body or authorization header.
+        # They may contain sensitive information. HTTP status is safe to share.
+        status = int(error.code)
+        explanations = {
+            400: "Invalid API request parameters",
+            401: "Authentication failed: check the COMPLETE, current API token",
+            403: "Permission denied: check Samsara token scopes and organization access",
+            404: "Endpoint not found",
+            429: "Rate limit reached; retry later",
+        }
+        description = explanations.get(status, "API request failed")
+        logger.warning("Samsara vehicle stats API returned HTTP %s", status)
         await update.effective_message.reply_text(
-            "Samsara GPS data unavailable or access denied. No messages sent to driver groups."
+            f"Samsara GPS check failed: HTTP {status}. {description}.\n"
+            "No messages sent to driver groups."
+        )
+        return None
+    except Exception as error:
+        # Do not serialize exception objects or URLs; they can expose credentials.
+        logger.warning("Samsara snapshot unavailable: %s", type(error).__name__)
+        await update.effective_message.reply_text(
+            f"Samsara GPS check failed ({type(error).__name__}). "
+            "No messages sent to driver groups."
         )
         return None
 
@@ -1221,7 +1241,7 @@ async def weather_post_shutdown(app):
 
 
 
-SPEAKER_BUILD = "2026-11-17-samsara-private-preview-v11"
+SPEAKER_BUILD = "2026-11-17-samsara-http-diagnostics-v11.1"
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
