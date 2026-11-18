@@ -11,6 +11,7 @@ import urllib.error
 import urllib.parse
 from datetime import timedelta
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from contextlib import contextmanager
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -978,8 +979,15 @@ async def samsarapreview_command(update: Update, context: ContextTypes.DEFAULT_T
     if not valid:
         await update.effective_message.reply_text("No qualifying active NWS warnings at this truck location right now.")
         return
+    try:
+        point_timezone = await asyncio.to_thread(nws_get_point_timezone, lat, lon)
+    except Exception:
+        logger.warning("NWS point time zone unavailable; using UTC in private preview")
+        point_timezone = None
     for item in valid[:5]:
-        await update.effective_message.reply_text(weather_message(item), parse_mode="HTML")
+        for message in weather_message_parts(item, unit=vehicle.get("name") or link[0],
+                                             timezone_name=point_timezone):
+            await update.effective_message.reply_text(message, parse_mode="HTML")
     if len(valid) > 5:
         await update.effective_message.reply_text(f"{len(valid)-5} additional warnings not shown.")
 
@@ -1141,37 +1149,89 @@ def weather_heading(event, general=False):
     return "⚠️ SEVERE WEATHER ALERT"
 
 
-def weather_message(info):
-    """Compact official NWS warning, with distinct emojis and blank-line spacing."""
+def nws_get_point_timezone(latitude, longitude):
+    """Get the official IANA time zone for the truck's actual GPS point.
+
+    Failure is safe: the formatter explicitly falls back to UTC rather than
+    guessing an offset from the state or alert coverage area.
+    """
+    url = f"https://api.weather.gov/points/{latitude:.4f},{longitude:.4f}"
+    request = urllib.request.Request(url, headers={
+        "Accept": "application/geo+json", "User-Agent": NWS_USER_AGENT,
+    })
+    with urllib.request.urlopen(request, timeout=18) as response:
+        result = json.load(response)
+    name = (result.get("properties") or {}).get("timeZone")
+    if not isinstance(name, str) or not name:
+        return None
+    try:
+        ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+    return name
+
+
+def weather_expiration_label(value, timezone_name=None):
+    """Convert an NWS UTC expiry to the verified point's local time zone."""
+    if timezone_name:
+        try:
+            local = value.astimezone(ZoneInfo(timezone_name))
+            return local.strftime("%b %d, %I:%M %p %Z")
+        except (ZoneInfoNotFoundError, ValueError):
+            pass
+    return value.astimezone(timezone.utc).strftime("%b %d, %I:%M %p UTC")
+
+
+def weather_message_parts(info, unit=None, timezone_name=None):
+    """Complete NWS region, no omitted zones, with Telegram-safe pagination.
+
+    No unit is inferred from an NWS region. A unit is included only when
+    verified against an explicitly linked Samsara vehicle.
+    """
     event = info["event"]
-    heading = weather_heading(event, event in GENERAL_ADVISORY_EVENTS)
-    # NWS areaDesc can list dozens of counties and forecast zones. Keep the
-    # message readable without falsely claiming one county is the truck's county.
-    areas = [part.strip() for part in info["area"].split(";") if part.strip()]
-    if not areas:
-        areas = [info["area"].strip()]
-    area = "; ".join(areas[:2])
-    if len(areas) > 2:
-        area += f" (+{len(areas) - 2} other NWS areas)"
-    if len(area) > 170:
-        area = area[:166].rsplit(" ", 1)[0] + "..."
-    fmt = lambda dt: dt.strftime("%b %d, %I:%M %p UTC")
-    hazard_icon = WEATHER_EMOJI.get(event, "🔎")
-    # Prevent duplicate emoji if the urgent/severe heading happens to use the
-    # same symbol as the weather hazard.
-    if hazard_icon in heading:
-        hazard_icon = "🔎"
-    lines = [
-        f"<b>{heading}</b>",
-        f"{hazard_icon} <b>Hazard:</b> {html.escape(event)}",
-        f"📍 <b>NWS Region:</b> {html.escape(area)}",
-        f"🕒 <b>Expires:</b> {fmt(info['expires'])}",
-    ]
+    title = weather_heading(event, event in GENERAL_ADVISORY_EVENTS)
+    icon = WEATHER_EMOJI.get(event, "🔎")
+    if icon in title:
+        icon = "🔎"
+    header = [f"<b>{title}</b>"]
+    if unit is not None:
+        header.append(f"🚛 <b>Alert For:</b> Unit {html.escape(str(unit))}")
+    header.append(f"{icon} <b>Hazard:</b> {html.escape(event)}")
+    header.append(f"🕒 <b>Expires:</b> {weather_expiration_label(info['expires'], timezone_name)}")
     action = EVENT_ACTIONS.get(event)
     if action:
-        lines.append(f"🚛 <b>Driver Action:</b> {html.escape(action)}")
-    lines.append("<i>Source: National Weather Service</i>")
-    return "\n\n".join(lines)
+        header.append(f"⚠️ <b>Driver Action:</b> {html.escape(action)}")
+    header.append("<i>Source: National Weather Service</i>")
+    # Do not summarize, trim, or substitute an inferred county for the NWS text.
+    area = info["area"].strip()
+    full = header[:3] + [f"📍 <b>Full Affected Region:</b> {html.escape(area)}"] + header[3:]
+    combined = "\n\n".join(full)
+    if len(combined) <= 3800:
+        return [combined]
+
+    # Long NWS region lists are sent as continuation parts, preserving EVERY
+    # character. HTML-escape after splitting the original text to avoid cuts
+    # through HTML entities. Keep each Telegram message well below 4096.
+    first = "\n\n".join(header + ["📍 <b>Full Affected Region:</b> See following region message(s)."]) 
+    parts = []
+    remaining = area
+    while remaining:
+        length = min(1800, len(remaining))
+        if length < len(remaining):
+            boundary = remaining.rfind(";", 0, length)
+            if boundary > length // 2:
+                length = boundary + 1
+        segment, remaining = remaining[:length], remaining[length:]
+        parts.append(segment)
+    result = [first]
+    for index, part in enumerate(parts, 1):
+        result.append(f"📍 <b>Full Affected Region ({index}/{len(parts)}):</b>\n\n{html.escape(part)}")
+    return result
+
+
+def weather_message(info, unit=None, timezone_name=None):
+    """Single message for ordinary regions; multi-part alerts use parts helper."""
+    return weather_message_parts(info, unit, timezone_name)[0]
 
 
 # Curated icons: each sample uses distinct symbols for title, condition and
@@ -1247,9 +1307,15 @@ async def weathercheck_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     await update.effective_message.reply_text(
         f"PRIVATE PREVIEW | {len(items)} qualifying active NWS alert(s). Nothing sent to groups.")
+    try:
+        point_timezone = await asyncio.to_thread(nws_get_point_timezone, lat, lon)
+    except Exception:
+        logger.warning("NWS point time zone unavailable; using UTC in private preview")
+        point_timezone = None
     for item in items[:8]:
-        await update.effective_message.reply_text(weather_message(item),
-                                                 parse_mode="HTML", disable_web_page_preview=True)
+        for message in weather_message_parts(item, timezone_name=point_timezone):
+            await update.effective_message.reply_text(
+                message, parse_mode="HTML", disable_web_page_preview=True)
     if len(items) > 8:
         await update.effective_message.reply_text(f"{len(items)-8} additional alerts omitted from preview.")
 
@@ -1373,8 +1439,11 @@ async def weather_scan(context):
             if latest is None or not latest.title or is_inactive_group_name(latest.title):
                 break
             try:
-                await context.bot.send_message(chat_id=chat_id, text=weather_message(item),
-                                               parse_mode="HTML", disable_web_page_preview=True)
+                # This path remains disabled in v14. If a later release enables
+                # it, preserve the full NWS area instead of truncating it.
+                for message in weather_message_parts(item):
+                    await context.bot.send_message(chat_id=chat_id, text=message,
+                                                   parse_mode="HTML", disable_web_page_preview=True)
             except TelegramError:
                 logger.exception("NWS alert delivery failed for chat %s", chat_id)
                 continue
@@ -1417,7 +1486,7 @@ async def weather_post_shutdown(app):
 
 
 
-SPEAKER_BUILD = "2026-11-18-weather-alert-refinement-v13"
+SPEAKER_BUILD = "2026-11-18-full-region-local-time-preview-v14"
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
