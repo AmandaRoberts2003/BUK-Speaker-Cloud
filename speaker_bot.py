@@ -3,6 +3,7 @@ import logging
 import html
 import os
 import re
+import secrets
 import sqlite3
 import json
 import urllib.request
@@ -373,6 +374,15 @@ def init_database():
             linked_at TEXT NOT NULL,
             linked_by INTEGER NOT NULL
         )""")
+        # Pending match reviews must be confirmed explicitly by the same admin.
+        conn.execute("""CREATE TABLE IF NOT EXISTS samsara_match_reviews (
+            admin_id INTEGER NOT NULL,
+            unit TEXT NOT NULL,
+            chat_id INTEGER NOT NULL,
+            vehicle_id TEXT NOT NULL,
+            reviewed_at TEXT NOT NULL,
+            PRIMARY KEY (admin_id, unit)
+        )""")
         # Archive is shared by authorized admins; no Telegram private-chat access is granted.
         conn.execute("""CREATE TABLE IF NOT EXISTS announcements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -700,6 +710,160 @@ async def samsaraunits_command(update: Update, context: ContextTypes.DEFAULT_TYP
         f"Samsara vehicles matching query: {len(matching)}\n" +
         ("\n".join(lines) if lines else "No matches") +
         "\n\nPrivate admin view only. Use exact vehicle ID for linking."
+    )
+
+
+# Conservative matching: BUK <unit> <driver>, with no status prefix. The
+# Samsara vehicle name must be EXACTLY the same decimal unit number.
+# We never infer a match from substrings (e.g. 111 versus 1111).
+GROUP_UNIT_RE = re.compile(r"^\s*BUK\s+(\d{2,6})(?=\s|$)", re.IGNORECASE)
+VEHICLE_UNIT_RE = re.compile(r"^\s*(\d{2,6})\s*$")
+MATCH_REVIEW_TTL_MINUTES = 20
+
+
+def group_unit_from_title(title):
+    if not title or is_inactive_group_name(title):
+        return None
+    match = GROUP_UNIT_RE.match(title)
+    return match.group(1) if match else None
+
+
+def vehicle_unit_from_name(name):
+    match = VEHICLE_UNIT_RE.fullmatch(str(name or ""))
+    return match.group(1) if match else None
+
+
+def unique_match_candidates(groups, vehicles, linked_groups=None, linked_vehicles=None):
+    """Return unambiguous 1:1 matches and counts, never guess from name similarity."""
+    linked_groups = set(linked_groups or ())
+    linked_vehicles = set(linked_vehicles or ())
+    by_unit_groups = {}
+    by_unit_vehicles = {}
+    skipped_inactive = 0
+    for chat_id, title in groups:
+        if is_inactive_group_name(title):
+            skipped_inactive += 1
+            continue
+        if chat_id in linked_groups:
+            continue
+        unit = group_unit_from_title(title)
+        if unit:
+            by_unit_groups.setdefault(unit, []).append((chat_id, title))
+    for vehicle_id, record in vehicles.items():
+        if vehicle_id in linked_vehicles:
+            continue
+        unit = vehicle_unit_from_name(record.get("name"))
+        if unit:
+            by_unit_vehicles.setdefault(unit, []).append((vehicle_id, record.get("name")))
+    matches = []
+    ambiguous = []
+    for unit in sorted(set(by_unit_groups) & set(by_unit_vehicles), key=lambda x: (int(x),x)):
+        gs, vs = by_unit_groups[unit], by_unit_vehicles[unit]
+        if len(gs) == 1 and len(vs) == 1:
+            matches.append((unit, gs[0][0], gs[0][1], vs[0][0]))
+        else:
+            ambiguous.append(unit)
+    return matches, ambiguous, skipped_inactive
+
+
+async def samsaramatchpreview_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Private, read-only match discovery. Stores proposals, never creates links."""
+    if not samsara_private_admin(update):
+        return
+    vehicles = await samsara_snapshot_or_error(update)
+    if vehicles is None:
+        return
+    with get_connection() as conn:
+        groups = conn.execute("SELECT chat_id, group_name FROM groups").fetchall()
+        linked = conn.execute("SELECT chat_id, vehicle_id FROM samsara_group_links").fetchall()
+    matches, ambiguous, inactive_count = unique_match_candidates(
+        groups, vehicles, {r[0] for r in linked}, {r[1] for r in linked}
+    )
+    # Verify the *current* Telegram title before offering a potential match.
+    verified = []
+    not_verified = 0
+    for unit, chat_id, title, vehicle_id in matches:
+        live = await get_live_group(chat_id, context)
+        if not live or live.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or group_unit_from_title(live.title) != unit:
+            not_verified += 1
+            continue
+        verified.append((unit, chat_id, live.title, vehicle_id))
+    now = datetime.now(timezone.utc).isoformat()
+    with get_connection() as conn:
+        conn.execute("DELETE FROM samsara_match_reviews WHERE admin_id=?", (update.effective_user.id,))
+        conn.executemany(
+            "INSERT INTO samsara_match_reviews (admin_id, unit, chat_id, vehicle_id, reviewed_at) VALUES (?, ?, ?, ?, ?)",
+            [(update.effective_user.id, unit, chat_id, vid, now) for unit, chat_id, _, vid in verified]
+        )
+    if not verified:
+        await update.effective_message.reply_text(
+            f"No unambiguous new matches. Ambiguous unit numbers: {len(ambiguous)}. "
+            f"Unverified groups: {not_verified}. Inactive skipped: {inactive_count}. "
+            "Existing links remain unchanged."
+        )
+        return
+    pagesize = 12
+    for i in range(0, len(verified), pagesize):
+        lines = ["SAMSARA MATCH PREVIEW - NO LINKS SAVED"]
+        if i == 0:
+            lines.append(f"Proposed: {len(verified)} | Ambiguous: {len(ambiguous)} | Unverified: {not_verified} | Inactive skipped: {inactive_count}")
+        for unit, chat_id, title, vid in verified[i:i+pagesize]:
+            lines.append(f"Unit {unit}: {title[:40]}\nGroup {chat_id} | Vehicle {vid}")
+        lines.append("Confirm ONE unit privately with: /samsaramatchconfirm 111")
+        await update.effective_message.reply_text("\n\n".join(lines))
+    if ambiguous:
+        await update.effective_message.reply_text(
+            "Ambiguous unit numbers (manual review only): " + ", ".join(ambiguous[:30])
+        )
+
+
+async def samsaramatchconfirm_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirm one previously reviewed match, rechecking every input live."""
+    if not samsara_private_admin(update):
+        return
+    if len(context.args) != 1 or not re.fullmatch(r"\d{2,6}", context.args[0]):
+        await update.effective_message.reply_text("Usage: /samsaramatchconfirm UNIT_NUMBER (after /samsaramatchpreview)")
+        return
+    unit = context.args[0]
+    with get_connection() as conn:
+        proposal = conn.execute(
+            "SELECT chat_id, vehicle_id, reviewed_at FROM samsara_match_reviews WHERE admin_id=? AND unit=?",
+            (update.effective_user.id, unit),
+        ).fetchone()
+    if not proposal:
+        await update.effective_message.reply_text("No reviewed match for that unit. Run /samsaramatchpreview first.")
+        return
+    chat_id, vehicle_id, reviewed_at = proposal
+    proposed_at = weather_parse_time(reviewed_at)
+    if not proposed_at or datetime.now(timezone.utc) - proposed_at > timedelta(minutes=MATCH_REVIEW_TTL_MINUTES):
+        await update.effective_message.reply_text("Match review expired. Run /samsaramatchpreview again.")
+        return
+    live = await get_live_group(chat_id, context)
+    if not live or live.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or group_unit_from_title(live.title) != unit:
+        await update.effective_message.reply_text("Group title changed or could not be verified. Nothing linked.")
+        return
+    vehicles = await samsara_snapshot_or_error(update)
+    if vehicles is None:
+        return
+    if vehicle_id not in vehicles or vehicle_unit_from_name(vehicles[vehicle_id].get("name")) != unit:
+        await update.effective_message.reply_text("Samsara vehicle name changed or missing. Nothing linked.")
+        return
+    with get_connection() as conn:
+        row = conn.execute("SELECT 1 FROM groups WHERE chat_id=?", (chat_id,)).fetchone()
+        existing_group = conn.execute("SELECT vehicle_id FROM samsara_group_links WHERE chat_id=?", (chat_id,)).fetchone()
+        existing_vehicle = conn.execute("SELECT chat_id FROM samsara_group_links WHERE vehicle_id=?", (vehicle_id,)).fetchone()
+        if not row or existing_group or existing_vehicle:
+            await update.effective_message.reply_text("Group or vehicle already linked, or registration missing. Nothing changed.")
+            return
+        conn.execute(
+            "INSERT INTO samsara_group_links (chat_id, vehicle_id, linked_at, linked_by) VALUES (?, ?, ?, ?)",
+            (chat_id, vehicle_id, datetime.now(timezone.utc).isoformat(), update.effective_user.id)
+        )
+        conn.execute("DELETE FROM samsara_match_reviews WHERE unit=?", (unit,))
+    await update.effective_message.reply_text(
+        f"Verified and linked unit {unit}.\nGroup: {live.title}\nVehicle ID: {vehicle_id}\n"
+        f"Next private GPS check: /samsarapreview {chat_id}\n"
+        "Automatic weather messages remain OFF."
     )
 
 
@@ -1241,7 +1405,7 @@ async def weather_post_shutdown(app):
 
 
 
-SPEAKER_BUILD = "2026-11-17-samsara-http-diagnostics-v11.1"
+SPEAKER_BUILD = "2026-11-18-samsara-match-review-v12"
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1509,6 +1673,8 @@ def main():
     app.add_handler(CommandHandler("version", version_command))
     app.add_handler(CommandHandler("samsarastatus", samsarastatus_command))
     app.add_handler(CommandHandler("samsaraunits", samsaraunits_command))
+    app.add_handler(CommandHandler("samsaramatchpreview", samsaramatchpreview_command))
+    app.add_handler(CommandHandler("samsaramatchconfirm", samsaramatchconfirm_command))
     app.add_handler(CommandHandler("samsaralink", samsaralink_command))
     app.add_handler(CommandHandler("samsaraunlink", samsaraunlink_command))
     app.add_handler(CommandHandler("samsarapreview", samsarapreview_command))
