@@ -1859,56 +1859,63 @@ async def weather_post_shutdown(app):
 
 # Fleet-report commands are read-only and ADMIN PRIVATE ONLY. No messages to groups.
 async def fleet_group_report_rows(context, include_samsara=False):
-    """Fetch live Telegram names, preserve failed verifications as unknown."""
+    """Fast, read-only inventory from saved registrations; do not query Telegram for every group.
+
+    Titles and active/inactive labels are CACHED, not authoritative. Sending and
+    automatic matching still use live Telegram checks before acting.
+    """
     with get_connection() as conn:
-        groups = conn.execute("SELECT chat_id, group_name FROM groups ORDER BY group_name, chat_id").fetchall()
-        links = dict(conn.execute("SELECT chat_id, vehicle_id FROM samsara_group_links").fetchall())
+        groups = conn.execute(
+            "SELECT chat_id, group_name FROM groups ORDER BY group_name, chat_id"
+        ).fetchall()
+        links = dict(conn.execute(
+            "SELECT chat_id, vehicle_id FROM samsara_group_links"
+        ).fetchall())
+
     vehicles, vehicle_error = None, None
     if include_samsara:
         try:
-            vehicles = await asyncio.to_thread(samsara_get_gps_snapshot)
+            vehicles = await asyncio.wait_for(
+                asyncio.to_thread(samsara_get_gps_snapshot), timeout=40
+            )
         except Exception as error:
             vehicle_error = type(error).__name__
-            logger.warning("Read-only fleet report: Samsara lookup unavailable (%s)", vehicle_error)
+            logger.warning("Fleet report Samsara lookup unavailable (%s)", vehicle_error)
+
     by_unit = {}
     if vehicles is not None:
         for vid, rec in vehicles.items():
             unit = vehicle_unit_from_name(rec.get("name"))
             if unit:
                 by_unit.setdefault(unit, []).append(str(vid))
+
     rows = []
-    for chat_id, saved_title in groups:
-        live = await get_live_group(chat_id, context)
-        if not live or live.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or not live.title:
-            title, status = saved_title, "UNVERIFIED"
-        else:
-            title = live.title
-            status = "INACTIVE" if is_inactive_group_name(title) else "ACTIVE"
-        unit = group_unit_from_title(title) if status == "ACTIVE" else None
+    for chat_id, stored_title in groups:
+        title = stored_title or "Unnamed group"
+        status = "INACTIVE (cached)" if is_inactive_group_name(title) else "ACTIVE (cached)"
+        unit = group_unit_from_title(title) if not is_inactive_group_name(title) else None
         vid = links.get(chat_id)
-        if status == "INACTIVE":
-            detail = "Excluded" + ("; old link retained" if vid else "")
-        elif status == "UNVERIFIED":
-            detail = "Cannot verify current Telegram group title"
+        if is_inactive_group_name(title):
+            detail = "Excluded based on saved title" + ("; old link retained" if vid else "")
         elif vid:
-            # A saved link does not establish that the group has the same current unit.
-            linked_unit = vehicle_unit_from_name(vehicles.get(vid, {}).get("name")) if vehicles is not None else None
+            linked_unit = (vehicle_unit_from_name(vehicles.get(vid, {}).get("name"))
+                           if vehicles is not None else None)
             if vehicles is not None and (linked_unit is None or unit != linked_unit):
-                detail = "LINK REVIEW NEEDED: vehicle/name mismatch"
+                detail = "LINK REVIEW NEEDED: saved group unit/vehicle mismatch"
             else:
                 detail = "Linked" + (f" (vehicle {vid})" if not include_samsara else "")
         elif not unit:
-            detail = "UNMATCHED: unit number not recognized in group title"
+            detail = "UNMATCHED: unit number not recognized in saved group title"
         elif vehicles is None:
-            detail = "UNMATCHED: Samsara lookup not available" if include_samsara else "Unlinked"
+            detail = "UNMATCHED: Samsara lookup unavailable" if include_samsara else "Unlinked"
         elif not by_unit.get(unit):
             detail = "UNMATCHED: unit not found in Samsara"
         elif len(by_unit[unit]) != 1:
             detail = "UNMATCHED: multiple Samsara vehicles use this unit"
         else:
             detail = "UNMATCHED: potential match requires review"
-        rows.append({"id":chat_id,"title":title,"status":status,"unit":unit,"vehicle":vid,"detail":detail})
-        await asyncio.sleep(0.02)
+        rows.append({"id": chat_id, "title": title, "status": status,
+                     "unit": unit, "vehicle": vid, "detail": detail})
     return rows, vehicle_error
 
 
@@ -1932,36 +1939,46 @@ async def fleet_report_send_pages(update, rows, title, summary):
 async def groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not samsara_private_admin(update):
         return
-    rows, _ = await fleet_group_report_rows(context, include_samsara=False)
-    active = sum(r['status'] == 'ACTIVE' for r in rows)
-    inactive = sum(r['status'] == 'INACTIVE' for r in rows)
-    unverified = sum(r['status'] == 'UNVERIFIED' for r in rows)
-    active_linked = sum(r['status'] == 'ACTIVE' and r['vehicle'] for r in rows)
-    summary = (f"Registered: {len(rows)} | Active: {active} | Inactive: {inactive} | "
-               f"Unverified: {unverified}\nActive linked: {active_linked} | "
-               f"Active unlinked: {active - active_linked}\n"
-               "Read-only snapshot; no driver messages sent.")
-    await fleet_report_send_pages(update, rows, "BUK SPEAKER | REGISTERED GROUPS", summary)
+    try:
+        rows, _ = await fleet_group_report_rows(context, include_samsara=False)
+        active = sum(r['status'].startswith('ACTIVE') for r in rows)
+        inactive = sum(r['status'].startswith('INACTIVE') for r in rows)
+        active_linked = sum(r['status'].startswith('ACTIVE') and r['vehicle'] for r in rows)
+        summary = (f"Registered: {len(rows)} | Active (cached): {active} | "
+                   f"Inactive (cached): {inactive}\n"
+                   f"Linked active (cached): {active_linked} | "
+                   f"Unlinked active (cached): {active-active_linked}\n"
+                   "Group titles are SAVED copies, not live verification. "
+                   "Broadcasts still check current titles. No driver messages sent.")
+        await fleet_report_send_pages(update, rows, "BUK SPEAKER | REGISTERED GROUPS", summary)
+    except Exception:
+        logger.exception("Fleet inventory command failed")
+        await update.effective_message.reply_text(
+            "Group report failed. Check FadeHost logs for 'Fleet inventory command failed'.")
 
 
 async def samsaraunmatched_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not samsara_private_admin(update):
         return
-    rows, error = await fleet_group_report_rows(context, include_samsara=True)
-    # Include current active groups without links, active links needing correction,
-    # and unverifiable groups. Inactive groups are excluded from operational counts.
-    pending = [r for r in rows if r['status'] == 'UNVERIFIED' or
-               (r['status'] == 'ACTIVE' and (not r['vehicle'] or 'REVIEW NEEDED' in r['detail']))]
-    active_unlinked = sum(r['status'] == 'ACTIVE' and not r['vehicle'] for r in rows)
-    review = sum(r['status'] == 'ACTIVE' and 'REVIEW NEEDED' in r['detail'] for r in rows)
-    summary = (f"Active unlinked: {active_unlinked} | Linked requiring review: {review} | "
-               f"Unverified: {sum(r['status']=='UNVERIFIED' for r in rows)}\n"
-               + (f"Samsara unavailable ({error}); reasons are incomplete.\n" if error else "")
-               + "Read-only report. No groups linked or notified.")
-    await fleet_report_send_pages(update, pending, "BUK SPEAKER | UNMATCHED GROUPS", summary)
+    await update.effective_message.reply_text(
+        "Checking saved group registrations against Samsara. Report is private; no group messages sent.")
+    try:
+        rows, error = await fleet_group_report_rows(context, include_samsara=True)
+        pending = [r for r in rows if r['status'].startswith('ACTIVE') and
+                   (not r['vehicle'] or 'REVIEW NEEDED' in r['detail'])]
+        unlinked = sum(r['status'].startswith('ACTIVE') and not r['vehicle'] for r in rows)
+        review = sum('REVIEW NEEDED' in r['detail'] for r in rows)
+        summary = (f"Active unlinked (cached): {unlinked} | Linked needing review: {review}\n"
+                   + (f"Samsara unavailable ({error}); reasons incomplete.\n" if error else "")
+                   + "Titles are saved copies. No groups linked or notified.")
+        await fleet_report_send_pages(update, pending, "BUK SPEAKER | UNMATCHED GROUPS", summary)
+    except Exception:
+        logger.exception("Unmatched fleet report command failed")
+        await update.effective_message.reply_text(
+            "Unmatched report failed. Check FadeHost logs for 'Unmatched fleet report command failed'.")
 
 
-SPEAKER_BUILD = "2026-11-18-fleet-registration-report-v17"
+SPEAKER_BUILD = "2026-11-18-fleet-registration-report-v17.1"
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
