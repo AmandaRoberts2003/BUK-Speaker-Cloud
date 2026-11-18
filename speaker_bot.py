@@ -384,6 +384,15 @@ def init_database():
             reviewed_at TEXT NOT NULL,
             PRIMARY KEY (admin_id, unit)
         )""")
+        # Read-only status/audit of automatic onboarding, preserved across restarts.
+        conn.execute("""CREATE TABLE IF NOT EXISTS samsara_auto_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            unit TEXT NOT NULL,
+            chat_id INTEGER NOT NULL,
+            vehicle_id TEXT NOT NULL,
+            status TEXT NOT NULL
+        )""")
         # Archive is shared by authorized admins; no Telegram private-chat access is granted.
         conn.execute("""CREATE TABLE IF NOT EXISTS announcements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -582,6 +591,8 @@ async def on_group_title_change(update: Update, context: ContextTypes.DEFAULT_TY
     if title:
         with get_connection() as conn:
             conn.execute("UPDATE groups SET group_name = ? WHERE chat_id = ?", (title, update.effective_chat.id))
+        # Auto-matching will check the live title on its next scheduled scan.
+        # Existing links are NOT silently reassigned when drivers/groups change.
 
 
 # SAMSARA PHASE 2: read-only GPS + PRIVATE preview. Never automatically sends to groups.
@@ -765,6 +776,176 @@ def unique_match_candidates(groups, vehicles, linked_groups=None, linked_vehicle
         else:
             ambiguous.append(unit)
     return matches, ambiguous, skipped_inactive
+
+
+# Future groups are onboarded without manual commands after an exact unique match.
+# IMPORTANT: This never turns on driver weather alerts (WEATHER_ENABLED is hard-OFF).
+SAMSARA_AUTO_ONBOARD_ENABLED = os.getenv("SAMSARA_AUTO_ONBOARD_ENABLED", "true").lower() == "true"
+SAMSARA_AUTO_SCAN_SECONDS = max(300, int(os.getenv("SAMSARA_AUTO_SCAN_SECONDS", "600")))
+AUTO_ONBOARD_ADMIN_NOTICES = os.getenv("SAMSARA_AUTO_ADMIN_NOTICES", "true").lower() == "true"
+
+
+def auto_onboard_candidates(groups, vehicles, linked):
+    """Strict global uniqueness, including already-linked groups and vehicles.
+
+    Never silently assign one vehicle to another group or guess from a driver name.
+    """
+    unit_groups = {}
+    unit_vehicles = {}
+    linked_chats = {row[0] for row in linked}
+    linked_vehicle_ids = {row[1] for row in linked}
+    for chat_id, title in groups:
+        unit = group_unit_from_title(title)
+        if unit:
+            unit_groups.setdefault(unit, []).append((chat_id, title))
+    for vehicle_id, rec in vehicles.items():
+        unit = vehicle_unit_from_name(rec.get("name"))
+        if unit:
+            unit_vehicles.setdefault(unit, []).append(vehicle_id)
+    candidates = []
+    ambiguous = []
+    no_vehicle = []
+    for unit, entries in unit_groups.items():
+        if len(entries) != 1 or len(unit_vehicles.get(unit, [])) > 1:
+            ambiguous.append(unit)
+            continue
+        if len(unit_vehicles.get(unit, [])) == 0:
+            no_vehicle.append(unit)
+            continue
+        chat_id, title = entries[0]
+        vid = unit_vehicles[unit][0]
+        if chat_id not in linked_chats and vid not in linked_vehicle_ids:
+            candidates.append((unit, chat_id, title, vid))
+    return candidates, ambiguous, no_vehicle
+
+
+async def run_auto_onboarding(app):
+    """Fail closed: partial snapshots, unverifiable titles, and conflicts aren't linked."""
+    result = {"new": [], "ambiguous": [], "missing": [], "error": None}
+    if not SAMSARA_AUTO_ONBOARD_ENABLED or not SAMSARA_API_TOKEN:
+        result["error"] = "Automatic matching disabled or Samsara token missing"
+        return result
+    lock = app.bot_data.setdefault("auto_match_lock", asyncio.Lock())
+    async with lock:
+        try:
+            vehicles = await asyncio.to_thread(samsara_get_gps_snapshot)
+        except Exception as exc:
+            logger.warning("Automatic Samsara matching skipped: %s", type(exc).__name__)
+            result["error"] = "Samsara vehicle snapshot unavailable"
+            return result
+        with get_connection() as conn:
+            groups = conn.execute("SELECT chat_id, group_name FROM groups").fetchall()
+            linked = conn.execute("SELECT chat_id, vehicle_id FROM samsara_group_links").fetchall()
+        # Independently verify every registered group's live Telegram title once.
+        # Cached group names cannot authorize matches, even for group renames.
+        live_groups = []
+        unverified_group_count = 0
+        for chat_id, stored_title in groups:
+            live = await get_live_group(chat_id, app)
+            if not live or live.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+                unverified_group_count += 1
+                continue
+            live_groups.append((chat_id, live.title or ""))
+            await asyncio.sleep(0.03)
+        candidates, ambiguous, missing = auto_onboard_candidates(live_groups, vehicles, linked)
+        result["ambiguous"] = sorted(set(ambiguous))
+        result["missing"] = sorted(set(missing))
+        result["unverified_groups"] = unverified_group_count
+        for unit, chat_id, stored_title, vehicle_id in candidates:
+            # If ANY registered group's live title was unavailable, the missing
+            # title could be a conflicting assignment. Defer until next cycle.
+            if unverified_group_count:
+                break
+            live = await get_live_group(chat_id, app)
+            if (not live or live.type not in (ChatType.GROUP, ChatType.SUPERGROUP)
+                    or group_unit_from_title(live.title) != unit):
+                continue
+            if vehicle_unit_from_name(vehicles[vehicle_id].get("name")) != unit:
+                continue
+            try:
+                with get_connection() as conn:
+                    previous = conn.execute(
+                        "SELECT vehicle_id FROM samsara_group_links WHERE chat_id=?", (chat_id,)
+                    ).fetchone()
+                    used = conn.execute(
+                        "SELECT chat_id FROM samsara_group_links WHERE vehicle_id=?", (vehicle_id,)
+                    ).fetchone()
+                    registered = conn.execute(
+                        "SELECT 1 FROM groups WHERE chat_id=?", (chat_id,)
+                    ).fetchone()
+                    if previous or used or not registered:
+                        continue
+                    now = datetime.now(timezone.utc).isoformat()
+                    conn.execute(
+                        "INSERT INTO samsara_group_links(chat_id,vehicle_id,linked_at,linked_by) VALUES (?,?,?,?)",
+                        (chat_id, vehicle_id, now, 0),
+                    )
+                    conn.execute(
+                        "INSERT INTO samsara_auto_events(created_at,unit,chat_id,vehicle_id,status) VALUES (?,?,?,?,?)",
+                        (now, unit, chat_id, vehicle_id, "linked"),
+                    )
+            except sqlite3.IntegrityError:
+                logger.info("Auto-link skipped due to simultaneous mapping change (unit %s)", unit)
+                continue
+            result["new"].append((unit, chat_id, live.title, vehicle_id))
+            logger.info("Auto-linked Samsara unit %s to verified Telegram group %s", unit, chat_id)
+        app.bot_data["auto_match_last_run"] = datetime.now(timezone.utc).isoformat()
+        app.bot_data["auto_match_last_result"] = {
+            "new": len(result["new"]), "ambiguous": len(result["ambiguous"]),
+            "missing": len(result["missing"]), "error": result["error"]
+        }
+    if result["new"] and AUTO_ONBOARD_ADMIN_NOTICES:
+        lines = ["SAMSARA AUTO-LINK | NEW GROUPS", ""]
+        lines.extend(f"Unit {unit}: {title} (group {chat_id})" for unit, chat_id, title, _ in result["new"])
+        lines.append("Weather delivery to driver groups remains OFF. GPS freshness checked only during previews.")
+        message = "\n".join(lines)
+        for admin_id in ADMIN_USER_IDS:
+            try:
+                await app.bot.send_message(chat_id=admin_id, text=message[:3900])
+            except TelegramError:
+                logger.warning("Unable to deliver onboarding notice to admin %s", admin_id)
+    return result
+
+
+async def samsara_auto_loop(app):
+    while True:
+        try:
+            await run_auto_onboarding(app)
+        except Exception as exc:
+            logger.warning("Automatic onboarding cycle failed: %s", type(exc).__name__)
+        await asyncio.sleep(SAMSARA_AUTO_SCAN_SECONDS)
+
+
+async def samsaraautostatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not samsara_private_admin(update):
+        return
+    with get_connection() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM samsara_group_links").fetchone()[0]
+        automatic = conn.execute("SELECT COUNT(*) FROM samsara_auto_events WHERE status='linked'").fetchone()[0]
+    last = context.application.bot_data.get("auto_match_last_result", {})
+    await update.effective_message.reply_text(
+        f"Automatic onboarding: {'ON' if SAMSARA_AUTO_ONBOARD_ENABLED else 'OFF'}\n"
+        f"Check interval: {SAMSARA_AUTO_SCAN_SECONDS // 60} minutes\n"
+        f"Total linked groups: {total}\n"
+        f"Links created automatically: {automatic}\n"
+        f"Last scan: {context.application.bot_data.get('auto_match_last_run', 'Not yet completed')}\n"
+        f"Last result: {last}\n"
+        "Driver weather delivery: OFF (private preview only)."
+    )
+
+
+async def samsaraautoscan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not samsara_private_admin(update):
+        return
+    await update.effective_message.reply_text("Checking new registered driver groups against Samsara...")
+    result = await run_auto_onboarding(context.application)
+    await update.effective_message.reply_text(
+        f"New verified links: {len(result['new'])}\n"
+        f"Ambiguous unit numbers: {len(result['ambiguous'])}\n"
+        f"Missing Samsara units: {len(result['missing'])}\n"
+        f"Status: {result['error'] or 'Complete'}\n"
+        "No weather alerts sent to driver groups."
+    )
 
 
 async def samsaramatchpreview_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1468,6 +1649,9 @@ async def weather_loop(app):
 
 
 async def weather_post_init(app):
+    if SAMSARA_AUTO_ONBOARD_ENABLED:
+        app.bot_data["samsara_auto_task"] = asyncio.create_task(samsara_auto_loop(app))
+        logger.info("Samsara automatic group matching enabled, interval %ss", SAMSARA_AUTO_SCAN_SECONDS)
     if WEATHER_ENABLED:
         app.bot_data["weather_task"] = asyncio.create_task(weather_loop(app))
         logger.info("Official NWS monitoring enabled, interval %ss", WEATHER_POLL_SECONDS)
@@ -1476,17 +1660,18 @@ async def weather_post_init(app):
 
 
 async def weather_post_shutdown(app):
-    task = app.bot_data.get("weather_task")
-    if task:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    for name in ("samsara_auto_task", "weather_task"):
+        task = app.bot_data.get(name)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
 
 
 
-SPEAKER_BUILD = "2026-11-18-full-region-local-time-preview-v14"
+SPEAKER_BUILD = "2026-11-18-auto-samsara-onboarding-v15"
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1501,7 +1686,8 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Automatic admin broadcast sharing: enabled\n"
         f"NWS weather monitoring: {'ON' if WEATHER_ENABLED else 'OFF (safe default)'}\n"
         f"Authorized admins: {len(ADMIN_USER_IDS)}\n"
-        "Samsara integration: PRIVATE PREVIEW ONLY"
+        f"Samsara auto-onboarding: {'ON' if SAMSARA_AUTO_ONBOARD_ENABLED else 'OFF'}\n"
+        "Samsara weather delivery: PRIVATE PREVIEW ONLY"
     )
 
 
@@ -1754,6 +1940,8 @@ def main():
     app.add_handler(CommandHandler("version", version_command))
     app.add_handler(CommandHandler("samsarastatus", samsarastatus_command))
     app.add_handler(CommandHandler("samsaraunits", samsaraunits_command))
+    app.add_handler(CommandHandler("samsaraautostatus", samsaraautostatus_command))
+    app.add_handler(CommandHandler("samsaraautoscan", samsaraautoscan_command))
     app.add_handler(CommandHandler("samsaramatchpreview", samsaramatchpreview_command))
     app.add_handler(CommandHandler("samsaramatchconfirm", samsaramatchconfirm_command))
     app.add_handler(CommandHandler("samsaralink", samsaralink_command))
