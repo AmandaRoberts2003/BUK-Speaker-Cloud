@@ -831,7 +831,7 @@ def auto_onboard_candidates(groups, vehicles, linked):
 
 async def run_auto_onboarding(app):
     """Fail closed: partial snapshots, unverifiable titles, and conflicts aren't linked."""
-    result = {"new": [], "ambiguous": [], "missing": [], "error": None}
+    result = {"new": [], "retired_inactive": [], "ambiguous": [], "missing": [], "error": None}
     if not SAMSARA_AUTO_ONBOARD_ENABLED or not SAMSARA_API_TOKEN:
         result["error"] = "Automatic matching disabled or Samsara token missing"
         return result
@@ -857,6 +857,35 @@ async def run_auto_onboarding(app):
                 continue
             live_groups.append((chat_id, live.title or ""))
             await asyncio.sleep(0.03)
+        # Only live Telegram titles are authoritative for retiring old links.
+        # Update saved titles for accurate read-only reports, too.
+        live_titles = dict(live_groups)
+        with get_connection() as conn:
+            conn.executemany(
+                "UPDATE groups SET group_name=? WHERE chat_id=?",
+                [(title, chat_id) for chat_id, title in live_groups],
+            )
+            # An old INACTIVE group's Samsara link is historical, not operational.
+            # Retire it only after Telegram confirms the current title is inactive.
+            # Never remove a link from an unverified group or a verified active group.
+            for chat_id, vehicle_id in linked:
+                title = live_titles.get(chat_id)
+                if title is None or not is_inactive_group_name(title):
+                    continue
+                deleted = conn.execute(
+                    "DELETE FROM samsara_group_links WHERE chat_id=? AND vehicle_id=?",
+                    (chat_id, vehicle_id),
+                ).rowcount
+                if deleted:
+                    now = datetime.now(timezone.utc).isoformat()
+                    unit = vehicle_unit_from_name(vehicles.get(str(vehicle_id), {}).get("name")) or "unknown"
+                    conn.execute(
+                        "INSERT INTO samsara_auto_events(created_at,unit,chat_id,vehicle_id,status) VALUES (?,?,?,?,?)",
+                        (now, unit, chat_id, vehicle_id, "retired_inactive"),
+                    )
+                    result["retired_inactive"].append((chat_id, vehicle_id))
+                    logger.info("Retired inactive group link for group %s", chat_id)
+            linked = conn.execute("SELECT chat_id, vehicle_id FROM samsara_group_links").fetchall()
         candidates, ambiguous, missing = auto_onboard_candidates(live_groups, vehicles, linked)
         result["ambiguous"] = sorted(set(ambiguous))
         result["missing"] = sorted(set(missing))
@@ -901,11 +930,15 @@ async def run_auto_onboarding(app):
             logger.info("Auto-linked Samsara unit %s to verified Telegram group %s", unit, chat_id)
         app.bot_data["auto_match_last_run"] = datetime.now(timezone.utc).isoformat()
         app.bot_data["auto_match_last_result"] = {
-            "new": len(result["new"]), "ambiguous": len(result["ambiguous"]),
+            "new": len(result["new"]), "retired_inactive": len(result["retired_inactive"]),
+            "ambiguous": len(result["ambiguous"]),
             "missing": len(result["missing"]), "error": result["error"]
         }
-    if result["new"] and AUTO_ONBOARD_ADMIN_NOTICES:
-        lines = ["SAMSARA AUTO-LINK | NEW GROUPS", ""]
+    if (result["new"] or result["retired_inactive"]) and AUTO_ONBOARD_ADMIN_NOTICES:
+        lines = ["SAMSARA AUTO-LINK | GROUP STATUS CHANGES", ""]
+        lines.append(f"Inactive links retired: {len(result['retired_inactive'])}")
+        lines.append(f"New active links created: {len(result['new'])}")
+        lines.append("")
         lines.extend(f"Unit {unit}: {title} (group {chat_id})" for unit, chat_id, title, _ in result["new"])
         lines.append("Weather delivery to driver groups remains OFF. GPS freshness checked only during previews.")
         message = "\n".join(lines)
@@ -950,7 +983,9 @@ async def samsaraautoscan_command(update: Update, context: ContextTypes.DEFAULT_
     await update.effective_message.reply_text("Checking new registered driver groups against Samsara...")
     result = await run_auto_onboarding(context.application)
     await update.effective_message.reply_text(
-        f"New verified links: {len(result['new'])}\n"
+        f"New verified active links: {len(result['new'])}\n"
+        f"Inactive group links retired: {len(result['retired_inactive'])}\n"
+        f"Unverified Telegram groups: {result.get('unverified_groups', 0)}\n"
         f"Ambiguous unit numbers: {len(result['ambiguous'])}\n"
         f"Missing Samsara units: {len(result['missing'])}\n"
         f"Status: {result['error'] or 'Complete'}\n"
@@ -1978,7 +2013,7 @@ async def samsaraunmatched_command(update: Update, context: ContextTypes.DEFAULT
             "Unmatched report failed. Check FadeHost logs for 'Unmatched fleet report command failed'.")
 
 
-SPEAKER_BUILD = "2026-11-20-fleet-registration-report-v17.2"
+SPEAKER_BUILD = "2026-11-20-active-only-onboarding-v18"
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
