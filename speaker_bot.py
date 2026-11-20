@@ -1943,7 +1943,7 @@ async def groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows, _ = await fleet_group_report_rows(context, include_samsara=False)
         active = sum(r['status'].startswith('ACTIVE') for r in rows)
         inactive = sum(r['status'].startswith('INACTIVE') for r in rows)
-        active_linked = sum(r['status'].startswith('ACTIVE') and r['vehicle'] for r in rows)
+        active_linked = sum(1 for r in rows if r['status'].startswith('ACTIVE') and r['vehicle'])
         summary = (f"Registered: {len(rows)} | Active (cached): {active} | "
                    f"Inactive (cached): {inactive}\n"
                    f"Linked active (cached): {active_linked} | "
@@ -1978,7 +1978,7 @@ async def samsaraunmatched_command(update: Update, context: ContextTypes.DEFAULT
             "Unmatched report failed. Check FadeHost logs for 'Unmatched fleet report command failed'.")
 
 
-SPEAKER_BUILD = "2026-11-18-fleet-registration-report-v17.1"
+SPEAKER_BUILD = "2026-11-20-fleet-registration-report-v17.2"
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
