@@ -1832,6 +1832,104 @@ async def weather_admin_loop(app):
         await asyncio.sleep(WEATHER_ADMIN_SCAN_SECONDS)
 
 
+def gps_diagnostic_reason(record, now):
+    """Explain why a Samsara GPS record is unusable, without estimating a position.
+
+    Returns (reason, last_utc) or (None, last_utc) for fresh valid GPS.
+    Uses the same freshness and geographic limits as samsara_valid_gps.
+    """
+    if not isinstance(record, dict):
+        return "GPS data missing", None
+    gps = record.get("gps")
+    if not isinstance(gps, dict):
+        return "GPS data missing", None
+    timestamp = weather_parse_time(gps.get("time"))
+    if timestamp is None:
+        return "GPS timestamp missing or invalid", None
+    stamp = timestamp.strftime("%Y-%m-%d %H:%M UTC")
+    if timestamp > now + timedelta(minutes=1):
+        return "GPS timestamp is in the future", stamp
+    age = now - timestamp
+    if age > timedelta(minutes=SAMSARA_MAX_GPS_AGE_MINUTES):
+        mins = int(age.total_seconds() // 60)
+        return f"GPS stale ({mins} minutes old; limit {SAMSARA_MAX_GPS_AGE_MINUTES})", stamp
+    lat, lon = gps.get("latitude"), gps.get("longitude")
+    if type(lat) not in (int, float) or type(lon) not in (int, float):
+        return "GPS coordinates missing or invalid", stamp
+    if not (18 <= lat <= 72 and -180 <= lon <= -60):
+        return "GPS coordinates outside supported US area", stamp
+    return None, stamp
+
+
+async def weathergpsissues_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Private, read-only diagnostics for ALL linked groups. Never notify drivers."""
+    if not samsara_private_admin(update):
+        return
+    await update.effective_message.reply_text(
+        "Checking linked truck GPS freshness privately. No driver messages will be sent."
+    )
+    if not SAMSARA_API_TOKEN:
+        await update.effective_message.reply_text("Samsara token missing; GPS diagnostics unavailable.")
+        return
+    try:
+        vehicles = await asyncio.to_thread(samsara_get_gps_snapshot)
+    except Exception as exc:
+        logger.warning("GPS diagnostics snapshot unavailable (%s)", type(exc).__name__)
+        await update.effective_message.reply_text("Samsara GPS snapshot unavailable. No changes made.")
+        return
+    with get_connection() as conn:
+        linked = conn.execute(
+            "SELECT chat_id, vehicle_id FROM samsara_group_links ORDER BY chat_id"
+        ).fetchall()
+    now = datetime.now(timezone.utc)
+    fresh = 0
+    issues = []
+    skipped = []
+    for chat_id, vehicle_id in linked:
+        live = await get_live_group(chat_id, context)
+        if not live or live.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or not live.title:
+            skipped.append(f"Group {chat_id}: Telegram group unverified")
+            continue
+        if is_inactive_group_name(live.title):
+            skipped.append(f"{live.title}: INACTIVE (excluded)")
+            continue
+        record = vehicles.get(str(vehicle_id))
+        title_unit = group_unit_from_title(live.title)
+        vehicle_unit = vehicle_unit_from_name(record.get("name")) if isinstance(record, dict) else None
+        if record is None:
+            skipped.append(f"{live.title}: linked Samsara vehicle missing from snapshot")
+            continue
+        if title_unit is None or title_unit != vehicle_unit:
+            skipped.append(f"{live.title}: unit mismatch (needs link review)")
+            continue
+        reason, stamp = gps_diagnostic_reason(record, now)
+        if reason is None:
+            fresh += 1
+            continue
+        issues.append(
+            f"Unit {title_unit} | {live.title}\n"
+            f"Problem: {reason}\n"
+            f"Last GPS: {stamp or 'Unavailable'}"
+        )
+    header = (
+        "BUK SPEAKER | PRIVATE GPS DIAGNOSTICS\n"
+        f"Linked groups: {len(linked)} | Fresh GPS: {fresh} | GPS issues: {len(issues)}\n"
+        f"Unverified/inactive/link review: {len(skipped)}\n"
+        f"GPS freshness threshold: {SAMSARA_MAX_GPS_AGE_MINUTES} minutes\n"
+        "GPS issues are not proof of equipment failure. Driver weather alerts remain OFF."
+    )
+    entries = issues + (["Other skipped groups:"] + skipped if skipped else [])
+    pages = [header]
+    for entry in entries:
+        if len(pages[-1]) + len(entry) + 2 > 3500:
+            pages.append("BUK SPEAKER | GPS DIAGNOSTICS (continued)")
+        pages[-1] += "\n\n" + entry
+    if not issues and not skipped:
+        pages[0] += "\n\nAll linked active groups have fresh usable GPS."
+    for page in pages:
+        await update.effective_message.reply_text(page)
+
+
 async def weatheradminstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not samsara_private_admin(update):
         return
@@ -2028,7 +2126,7 @@ async def samsaraunmatched_command(update: Update, context: ContextTypes.DEFAULT
             "Unmatched report failed. Check FadeHost logs for 'Unmatched fleet report command failed'.")
 
 
-SPEAKER_BUILD = "2026-11-20-independent-onboarding-v19"
+SPEAKER_BUILD = "2026-11-20-gps-diagnostics-v20"
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2303,6 +2401,7 @@ def main():
     app.add_handler(CommandHandler("groups", groups_command))
     app.add_handler(CommandHandler("samsaraunmatched", samsaraunmatched_command))
     app.add_handler(CommandHandler("weatheradminstatus", weatheradminstatus_command))
+    app.add_handler(CommandHandler("weathergpsissues", weathergpsissues_command))
     app.add_handler(CommandHandler("weatheradminscan", weatheradminscan_command))
     app.add_handler(CommandHandler("samsaramatchpreview", samsaramatchpreview_command))
     app.add_handler(CommandHandler("samsaramatchconfirm", samsaramatchconfirm_command))
