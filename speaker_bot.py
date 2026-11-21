@@ -735,11 +735,13 @@ async def samsaraunits_command(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
-# Conservative matching: BUK <unit> <driver>, with no status prefix. The
-# Samsara vehicle name must be EXACTLY the same decimal unit number.
-# We never infer a match from substrings (e.g. 111 versus 1111).
-GROUP_UNIT_RE = re.compile(r"^\s*BUK\s+(\d{2,6})(?=\s|$)", re.IGNORECASE)
-VEHICLE_UNIT_RE = re.compile(r"^\s*(\d{2,6})\s*$")
+# Exact unit matching, including approved alphanumeric identifiers such as
+# 126B, 701A, and S009. Never use substrings or infer a vehicle from a name.
+# A unit must begin with a digit, or contain one leading letter followed by digits;
+# one final letter is allowed only when the unit begins with a digit.
+UNIT_PATTERN = r"(?:[0-9]{2,6}[A-Z]?|[A-Z][0-9]{2,6})"
+GROUP_UNIT_RE = re.compile(r"^\s*BUK\s+(" + UNIT_PATTERN + r")(?=\s|$)", re.IGNORECASE)
+VEHICLE_UNIT_RE = re.compile(r"^\s*(" + UNIT_PATTERN + r")\s*$", re.IGNORECASE)
 MATCH_REVIEW_TTL_MINUTES = 20
 
 
@@ -747,12 +749,12 @@ def group_unit_from_title(title):
     if not title or is_inactive_group_name(title):
         return None
     match = GROUP_UNIT_RE.match(title)
-    return match.group(1) if match else None
+    return match.group(1).upper() if match else None
 
 
 def vehicle_unit_from_name(name):
     match = VEHICLE_UNIT_RE.fullmatch(str(name or ""))
-    return match.group(1) if match else None
+    return match.group(1).upper() if match else None
 
 
 def unique_match_candidates(groups, vehicles, linked_groups=None, linked_vehicles=None):
@@ -779,7 +781,7 @@ def unique_match_candidates(groups, vehicles, linked_groups=None, linked_vehicle
             by_unit_vehicles.setdefault(unit, []).append((vehicle_id, record.get("name")))
     matches = []
     ambiguous = []
-    for unit in sorted(set(by_unit_groups) & set(by_unit_vehicles), key=lambda x: (int(x),x)):
+    for unit in sorted(set(by_unit_groups) & set(by_unit_vehicles), key=lambda x: (x,)):
         gs, vs = by_unit_groups[unit], by_unit_vehicles[unit]
         if len(gs) == 1 and len(vs) == 1:
             matches.append((unit, gs[0][0], gs[0][1], vs[0][0]))
@@ -846,16 +848,25 @@ async def run_auto_onboarding(app):
         with get_connection() as conn:
             groups = conn.execute("SELECT chat_id, group_name FROM groups").fetchall()
             linked = conn.execute("SELECT chat_id, vehicle_id FROM samsara_group_links").fetchall()
-        # Independently verify every registered group's live Telegram title once.
-        # Cached group names cannot authorize matches, even for group renames.
+        # Verify current titles. An inaccessible group can block ONLY its own
+        # known unit, never automatic matching across the entire fleet.
+        # Its SAVED title is used to veto potentially conflicting assignments,
+        # but is never used to authorize a new link.
         live_groups = []
         unverified_group_count = 0
+        blocked_units = set()
         for chat_id, stored_title in groups:
             live = await get_live_group(chat_id, app)
-            if not live or live.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+            if not live or live.type not in (ChatType.GROUP, ChatType.SUPERGROUP) or not live.title:
                 unverified_group_count += 1
+                # If we cannot verify a previously active group's current title,
+                # don't risk connecting another group with that same unit.
+                # Historical titles marked Inactive cannot authorize a link.
+                old_unit = group_unit_from_title(stored_title)
+                if old_unit:
+                    blocked_units.add(old_unit)
                 continue
-            live_groups.append((chat_id, live.title or ""))
+            live_groups.append((chat_id, live.title))
             await asyncio.sleep(0.03)
         # Only live Telegram titles are authoritative for retiring old links.
         # Update saved titles for accurate read-only reports, too.
@@ -890,11 +901,12 @@ async def run_auto_onboarding(app):
         result["ambiguous"] = sorted(set(ambiguous))
         result["missing"] = sorted(set(missing))
         result["unverified_groups"] = unverified_group_count
+        result["blocked_units"] = sorted(blocked_units)
         for unit, chat_id, stored_title, vehicle_id in candidates:
-            # If ANY registered group's live title was unavailable, the missing
-            # title could be a conflicting assignment. Defer until next cycle.
-            if unverified_group_count:
-                break
+            # An unverifiable group with this SAME saved unit prevents unsafe
+            # remapping, but does not block unrelated verified trucks.
+            if unit in blocked_units:
+                continue
             live = await get_live_group(chat_id, app)
             if (not live or live.type not in (ChatType.GROUP, ChatType.SUPERGROUP)
                     or group_unit_from_title(live.title) != unit):
@@ -932,7 +944,9 @@ async def run_auto_onboarding(app):
         app.bot_data["auto_match_last_result"] = {
             "new": len(result["new"]), "retired_inactive": len(result["retired_inactive"]),
             "ambiguous": len(result["ambiguous"]),
-            "missing": len(result["missing"]), "error": result["error"]
+            "missing": len(result["missing"]),
+            "unverified_groups": unverified_group_count,
+            "blocked_units": len(blocked_units), "error": result["error"]
         }
     if (result["new"] or result["retired_inactive"]) and AUTO_ONBOARD_ADMIN_NOTICES:
         lines = ["SAMSARA AUTO-LINK | GROUP STATUS CHANGES", ""]
@@ -986,6 +1000,7 @@ async def samsaraautoscan_command(update: Update, context: ContextTypes.DEFAULT_
         f"New verified active links: {len(result['new'])}\n"
         f"Inactive group links retired: {len(result['retired_inactive'])}\n"
         f"Unverified Telegram groups: {result.get('unverified_groups', 0)}\n"
+        f"Units held for verification: {len(result.get('blocked_units', []))}\n"
         f"Ambiguous unit numbers: {len(result['ambiguous'])}\n"
         f"Missing Samsara units: {len(result['missing'])}\n"
         f"Status: {result['error'] or 'Complete'}\n"
@@ -1048,10 +1063,10 @@ async def samsaramatchconfirm_command(update: Update, context: ContextTypes.DEFA
     """Confirm one previously reviewed match, rechecking every input live."""
     if not samsara_private_admin(update):
         return
-    if len(context.args) != 1 or not re.fullmatch(r"\d{2,6}", context.args[0]):
+    if len(context.args) != 1 or not VEHICLE_UNIT_RE.fullmatch(context.args[0]):
         await update.effective_message.reply_text("Usage: /samsaramatchconfirm UNIT_NUMBER (after /samsaramatchpreview)")
         return
-    unit = context.args[0]
+    unit = context.args[0].upper()
     with get_connection() as conn:
         proposal = conn.execute(
             "SELECT chat_id, vehicle_id, reviewed_at FROM samsara_match_reviews WHERE admin_id=? AND unit=?",
@@ -2013,7 +2028,7 @@ async def samsaraunmatched_command(update: Update, context: ContextTypes.DEFAULT
             "Unmatched report failed. Check FadeHost logs for 'Unmatched fleet report command failed'.")
 
 
-SPEAKER_BUILD = "2026-11-20-active-only-onboarding-v18"
+SPEAKER_BUILD = "2026-11-20-independent-onboarding-v19"
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
