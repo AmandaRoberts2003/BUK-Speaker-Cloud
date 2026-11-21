@@ -2072,6 +2072,71 @@ async def weathergpsissues_command(update: Update, context: ContextTypes.DEFAULT
         await update.effective_message.reply_text(page)
 
 
+async def gpshealthstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Private, read-only audit of GPS incidents and notification deduplication.
+
+    No Samsara requests, database modifications, or driver-group messages.
+    An incident may remain open while a private recovery notice is pending.
+    """
+    if not samsara_private_admin(update):
+        return
+    now = datetime.now(timezone.utc)
+    with get_connection() as conn:
+        episodes = conn.execute("""
+            SELECT e.chat_id, e.vehicle_id, e.started_at, e.state,
+                   e.last_checked_at, COALESCE(g.group_name, 'Unknown group'),
+                   (SELECT COUNT(*) FROM gps_health_notifications n
+                    WHERE n.chat_id=e.chat_id AND n.episode_started_at=e.started_at
+                      AND n.kind='stale') AS stale_copies,
+                   (SELECT COUNT(*) FROM gps_health_notifications n
+                    WHERE n.chat_id=e.chat_id AND n.episode_started_at=e.started_at
+                      AND n.kind='recovered') AS recovery_copies
+            FROM gps_health_episodes e
+            LEFT JOIN groups g ON g.chat_id=e.chat_id
+            ORDER BY e.last_checked_at DESC, e.chat_id
+        """).fetchall()
+        notifications = conn.execute("""
+            SELECT kind, COUNT(*) FROM gps_health_notifications GROUP BY kind
+        """).fetchall()
+    counts = dict(notifications)
+    issue_count = sum(1 for e in episodes if e[3] == 'issue')
+    recovery_pending = sum(1 for e in episodes if e[3] == 'recovered')
+    header = (
+        'BUK SPEAKER | GPS HEALTH INCIDENT STATUS\n'
+        f'Open issues: {issue_count} | Pending recovery closure: {recovery_pending}\n'
+        f'Private warning copies recorded: {counts.get("stale", 0)}\n'
+        f'Private recovery copies recorded: {counts.get("recovered", 0)}\n'
+        'Read-only saved incident data; not a live GPS scan.\n'
+        'Driver weather delivery: OFF.'
+    )
+    pages = [header]
+    for chat_id, vehicle_id, started, state, checked, title, stale_copies, recovered_copies in episodes:
+        # An inactive group's historical incident may remain stored, but is never
+        # an operational destination. Do not imply a cached title is live.
+        if is_inactive_group_name(title):
+            status = 'INACTIVE (cached; not monitored)'
+        elif state == 'recovered':
+            status = 'Recovered; private recovery delivery pending'
+        else:
+            status = 'GPS issue being monitored'
+        since = weather_parse_time(started)
+        age = f'{int((now - since).total_seconds() // 60)} min' if since and since <= now else 'Unknown'
+        entry = (
+            f'Group: {title}\n'
+            f'Chat ID: {chat_id} | Vehicle ID: {vehicle_id}\n'
+            f'Status: {status}\n'
+            f'Incident age: {age} | Last checked: {checked}\n'
+            f'Private notices recorded: issue {stale_copies}, recovery {recovered_copies}'
+        )
+        if len(pages[-1]) + len(entry) + 2 > 3500:
+            pages.append('BUK SPEAKER | GPS HEALTH INCIDENTS (continued)')
+        pages[-1] += '\n\n' + entry
+    if not episodes:
+        pages[0] += '\n\nNo open GPS health incidents recorded.'
+    for page in pages:
+        await update.effective_message.reply_text(page)
+
+
 async def weatheradminstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not samsara_private_admin(update):
         return
@@ -2272,7 +2337,7 @@ async def samsaraunmatched_command(update: Update, context: ContextTypes.DEFAULT
             "Unmatched report failed. Check FadeHost logs for 'Unmatched fleet report command failed'.")
 
 
-SPEAKER_BUILD = "2026-11-20-gps-health-v21"
+SPEAKER_BUILD = "2026-11-20-gps-health-audit-v22"
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2548,6 +2613,7 @@ def main():
     app.add_handler(CommandHandler("samsaraunmatched", samsaraunmatched_command))
     app.add_handler(CommandHandler("weatheradminstatus", weatheradminstatus_command))
     app.add_handler(CommandHandler("weathergpsissues", weathergpsissues_command))
+    app.add_handler(CommandHandler("gpshealthstatus", gpshealthstatus_command))
     app.add_handler(CommandHandler("weatheradminscan", weatheradminscan_command))
     app.add_handler(CommandHandler("samsaramatchpreview", samsaramatchpreview_command))
     app.add_handler(CommandHandler("samsaramatchconfirm", samsaramatchconfirm_command))
