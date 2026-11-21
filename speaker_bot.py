@@ -419,6 +419,17 @@ def init_database():
             delivered_at TEXT NOT NULL,
             PRIMARY KEY (chat_id, episode_started_at, admin_id, kind)
         )""")
+        # v24: persistent pilot-only real-NWS test delivery records. Never driver groups.
+        conn.execute("""CREATE TABLE IF NOT EXISTS weather_pilot_live_deliveries (
+            source_chat_id INTEGER NOT NULL,
+            alert_id TEXT NOT NULL,
+            destination_chat_id INTEGER NOT NULL,
+            event TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('pending','sent')),
+            created_at TEXT NOT NULL,
+            sent_at TEXT,
+            PRIMARY KEY(source_chat_id, alert_id)
+        )""")
         # Archive is shared by authorized admins; no Telegram private-chat access is granted.
         conn.execute("""CREATE TABLE IF NOT EXISTS announcements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2337,7 +2348,7 @@ async def samsaraunmatched_command(update: Update, context: ContextTypes.DEFAULT
             "Unmatched report failed. Check FadeHost logs for 'Unmatched fleet report command failed'.")
 
 
-SPEAKER_BUILD = "2026-11-20-weather-test-pilot-v23"
+SPEAKER_BUILD = "2026-11-21-live-nws-pilot-v24"
 
 
 # V23: MANUAL, EXPLICITLY-APPROVED TEST-GROUP ONLY PILOT.
@@ -2365,11 +2376,13 @@ async def weatherpilotstatus_command(update: Update, context: ContextTypes.DEFAU
     await update.effective_message.reply_text(
         "BUK SPEAKER | WEATHER TEST PILOT\n"
         f"Test group configured: {'YES' if configured else 'NO'}\n"
-        "Pilot type: manual simulated message only\n"
+        "Pilot type: simulated delivery or manual REAL NWS test mirror\n"
         "Group ID and live group title validated before each test\n"
         f"Production weather alerts: {'ON' if WEATHER_ENABLED else 'OFF'}\n"
-        "No automatic pilot deliveries. No live NWS warnings sent by pilot.\n"
-        "To test: /weatherpilottest GROUP_CHAT_ID CONFIRM"
+        "No automatic pilot deliveries. Live NWS mirrors are TEST-only.\n"
+        "Simulation: /weatherpilottest TEST_GROUP_CHAT_ID CONFIRM\n"
+        "Live NWS: /weatherpilotlive SOURCE_DRIVER_GROUP_ID CONFIRM\n"
+        "History: /weatherpilotlivehistory"
     )
 
 
@@ -2437,6 +2450,166 @@ async def weatherpilottest_command(update: Update, context: ContextTypes.DEFAULT
         "This was a simulated message, not a real NWS alert.\n"
         "Production driver weather alerts remain OFF."
     )
+
+
+# v24: A real NWS warning can be mirrored ONLY to the explicitly configured TEST
+# group, under a manual private admin command. Never to a source driver group.
+# No scheduled live pilot and no activation of WEATHER_ENABLED.
+async def weatherpilotlive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mirror one real, qualifying point-based NWS warning into TEST, once."""
+    if not samsara_private_admin(update):
+        return
+    args = context.args or []
+    if (len(args) != 2 or args[1] != "CONFIRM" or
+            not re.fullmatch(r"-\d{5,20}", args[0])):
+        await update.effective_message.reply_text(
+            "Usage: /weatherpilotlive SOURCE_DRIVER_GROUP_ID CONFIRM\n"
+            "Live NWS data is sent ONLY to the configured non-driver TEST group."
+        )
+        return
+    source_id = int(args[0])
+    # The destination is never supplied in the command. It is a host allowlist.
+    if not WEATHER_PILOT_TEST_CHAT_ID or not re.fullmatch(r"-\d{5,20}", WEATHER_PILOT_TEST_CHAT_ID):
+        await update.effective_message.reply_text("DENIED: valid WEATHER_PILOT_TEST_CHAT_ID missing.")
+        return
+    dest_id = int(WEATHER_PILOT_TEST_CHAT_ID)
+    if source_id == dest_id:
+        await update.effective_message.reply_text("DENIED: the test group cannot be the source truck group.")
+        return
+    with get_connection() as conn:
+        registered_dest = conn.execute("SELECT 1 FROM groups WHERE chat_id=?", (dest_id,)).fetchone()
+        # A test destination must NEVER also be an operational Samsara-linked group.
+        linked_dest = conn.execute("SELECT 1 FROM samsara_group_links WHERE chat_id=?", (dest_id,)).fetchone()
+        source_link = conn.execute("SELECT vehicle_id FROM samsara_group_links WHERE chat_id=?", (source_id,)).fetchone()
+    if not registered_dest or linked_dest or not source_link:
+        await update.effective_message.reply_text(
+            "DENIED: test group must be registered and NOT Samsara-linked; "
+            "source must be a verified linked truck group. No messages sent.")
+        return
+    destination = await get_live_group(dest_id, context)
+    source = await get_live_group(source_id, context)
+    if (not destination or destination.type not in (ChatType.GROUP, ChatType.SUPERGROUP)
+            or not weather_pilot_allowed(dest_id, destination.title)):
+        await update.effective_message.reply_text("DENIED: test destination's live title is not approved TEST.")
+        return
+    if (not source or source.type not in (ChatType.GROUP, ChatType.SUPERGROUP)
+            or not source.title or is_inactive_group_name(source.title)
+            or not group_unit_from_title(source.title)):
+        await update.effective_message.reply_text("DENIED: source driver group inactive or unverified.")
+        return
+    vehicles = await samsara_snapshot_or_error(update)
+    if vehicles is None:
+        return
+    vehicle_id = str(source_link[0])
+    record = vehicles.get(vehicle_id)
+    unit = group_unit_from_title(source.title)
+    if not record or vehicle_unit_from_name(record.get("name")) != unit:
+        await update.effective_message.reply_text("DENIED: Samsara source unit/link mismatch.")
+        return
+    now = datetime.now(timezone.utc)
+    gps = samsara_valid_gps(record.get("gps"), now=now)
+    if gps is None:
+        await update.effective_message.reply_text("No delivery: source truck GPS is stale/missing/invalid.")
+        return
+    lat, lon, timestamp = gps
+    try:
+        features = await asyncio.to_thread(nws_get_active_point, lat, lon)
+    except Exception as exc:
+        logger.warning("Live NWS test lookup failed (%s)", type(exc).__name__)
+        await update.effective_message.reply_text("NWS lookup failed. No test or driver message sent.")
+        return
+    qualified = [item for feature in features
+                 if (item := weather_active_record(feature, now=now)) is not None
+                 and item["starts"] <= now]
+    if not qualified:
+        await update.effective_message.reply_text(
+            f"Live NWS lookup completed for Unit {unit} (GPS {timestamp:%Y-%m-%d %H:%M} UTC).\n"
+            "No qualifying active NWS warning. Nothing sent to any group.")
+        return
+    # Choose just one warning for this manual command. No scheduled deliveries.
+    item = qualified[0]
+    with get_connection() as conn:
+        prior = conn.execute("SELECT status FROM weather_pilot_live_deliveries "
+                             "WHERE source_chat_id=? AND alert_id=?", (source_id, item["id"])).fetchone()
+    if prior:
+        await update.effective_message.reply_text(
+            f"DUPLICATE SUPPRESSED: Unit {unit}, {item['event']} (record: {prior[0]}). "
+            "No additional test or driver message sent.")
+        return
+    # Verify identities and mapping again IMMEDIATELY before sending.
+    destination2 = await get_live_group(dest_id, context)
+    source2 = await get_live_group(source_id, context)
+    with get_connection() as conn:
+        link_now = conn.execute("SELECT vehicle_id FROM samsara_group_links WHERE chat_id=?", (source_id,)).fetchone()
+        dest_link_now = conn.execute("SELECT 1 FROM samsara_group_links WHERE chat_id=?", (dest_id,)).fetchone()
+    if (not destination2 or destination2.type not in (ChatType.GROUP, ChatType.SUPERGROUP)
+            or not weather_pilot_allowed(dest_id, destination2.title)
+            or not source2 or source2.type not in (ChatType.GROUP, ChatType.SUPERGROUP)
+            or group_unit_from_title(source2.title) != unit or not link_now
+            or str(link_now[0]) != vehicle_id or dest_link_now):
+        await update.effective_message.reply_text("DENIED: group/link changed during test. No messages sent.")
+        return
+    # Reserve the real NWS alert ID before sending: fail-closed on retries and
+    # crashes. A 'pending' record requires admin review instead of auto-resend.
+    try:
+        with get_connection() as conn:
+            conn.execute("""INSERT INTO weather_pilot_live_deliveries
+                (source_chat_id,alert_id,destination_chat_id,event,status,created_at)
+                VALUES (?,?,?,?,?,?)""",
+                (source_id, item["id"], dest_id, item["event"], "pending", now.isoformat()))
+    except sqlite3.IntegrityError:
+        await update.effective_message.reply_text("DUPLICATE SUPPRESSED. No messages sent.")
+        return
+    try:
+        tz = await asyncio.to_thread(nws_get_point_timezone, lat, lon)
+    except Exception:
+        tz = None
+    prefix = (
+        "🧪 <b>BUK SPEAKER | LIVE NWS DATA — TEST GROUP ONLY</b>\n"
+        "<b>NOT A WARNING FOR MEMBERS OF THIS TEST GROUP.</b>\n\n"
+        f"<b>Source:</b> real NWS point lookup for Samsara Unit {html.escape(unit)}\n"
+        f"<b>GPS timestamp:</b> {timestamp:%Y-%m-%d %H:%M} UTC\n"
+        "<b>Destination:</b> authorized non-driver TEST group\n"
+        "<b>Driver group delivery:</b> OFF\n\n"
+    )
+    parts = weather_message_parts(item, unit=unit, timezone_name=tz)
+    try:
+        await context.bot.send_message(
+            chat_id=dest_id, text=prefix, parse_mode="HTML", disable_web_page_preview=True)
+        for part in parts:
+            await context.bot.send_message(
+                chat_id=dest_id,
+                text="🧪 <b>TEST GROUP COPY — NOT A WARNING FOR THIS GROUP</b>\n\n" + part,
+                parse_mode="HTML", disable_web_page_preview=True)
+    except TelegramError as exc:
+        logger.warning("Live NWS pilot test delivery incomplete (%s)", type(exc).__name__)
+        await update.effective_message.reply_text(
+            "Test delivery failed or was partial. Record remains PENDING to prevent duplicate replay. "
+            "Inspect SPEAKER TEST. Production driver messages were not sent.")
+        return
+    with get_connection() as conn:
+        conn.execute("""UPDATE weather_pilot_live_deliveries SET status='sent',sent_at=?
+            WHERE source_chat_id=? AND alert_id=?""",
+            (datetime.now(timezone.utc).isoformat(), source_id, item["id"]))
+    await update.effective_message.reply_text(
+        f"LIVE NWS TEST SENT ONLY TO {destination2.title}.\n"
+        f"Source: Unit {unit} | Hazard: {item['event']} | Parts: {len(parts)}\n"
+        "Same source alert ID will not be sent again. Production driver alerts: OFF.")
+
+
+async def weatherpilotlivehistory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Read-only view of real-NWS test receipts, including partial pending sends."""
+    if not samsara_private_admin(update):
+        return
+    with get_connection() as conn:
+        rows = conn.execute("""SELECT source_chat_id,event,status,created_at
+            FROM weather_pilot_live_deliveries ORDER BY created_at DESC LIMIT 12""").fetchall()
+    lines = ["BUK SPEAKER | LIVE NWS TEST HISTORY", "Production driver alerts: OFF."]
+    for source_id, event, status, created in rows:
+        lines.append(f"Source {source_id} | {event} | {status} | {created}")
+    if not rows:
+        lines.append("No live NWS pilot deliveries recorded.")
+    await update.effective_message.reply_text("\n".join(lines))
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2713,6 +2886,8 @@ def main():
     app.add_handler(CommandHandler("weatheradminstatus", weatheradminstatus_command))
     app.add_handler(CommandHandler("weatherpilotstatus", weatherpilotstatus_command))
     app.add_handler(CommandHandler("weatherpilottest", weatherpilottest_command))
+    app.add_handler(CommandHandler("weatherpilotlive", weatherpilotlive_command))
+    app.add_handler(CommandHandler("weatherpilotlivehistory", weatherpilotlivehistory_command))
     app.add_handler(CommandHandler("weathergpsissues", weathergpsissues_command))
     app.add_handler(CommandHandler("gpshealthstatus", gpshealthstatus_command))
     app.add_handler(CommandHandler("weatheradminscan", weatheradminscan_command))
