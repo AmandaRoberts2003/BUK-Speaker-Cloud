@@ -2337,7 +2337,106 @@ async def samsaraunmatched_command(update: Update, context: ContextTypes.DEFAULT
             "Unmatched report failed. Check FadeHost logs for 'Unmatched fleet report command failed'.")
 
 
-SPEAKER_BUILD = "2026-11-20-gps-health-audit-v22"
+SPEAKER_BUILD = "2026-11-20-weather-test-pilot-v23"
+
+
+# V23: MANUAL, EXPLICITLY-APPROVED TEST-GROUP ONLY PILOT.
+# Deliberately cannot send live NWS alerts or notify any production driver group.
+# WEATHER_ENABLED stays hard-disabled. This pilot does not run on a schedule.
+WEATHER_PILOT_TEST_CHAT_ID = os.getenv("WEATHER_PILOT_TEST_CHAT_ID", "").strip()
+WEATHER_PILOT_LAST_SENT = None
+
+
+def weather_pilot_allowed(chat_id, title):
+    """Deny by default: exact allowlisted group ID AND clearly named TEST group."""
+    return (WEATHER_PILOT_TEST_CHAT_ID.startswith("-")
+            and WEATHER_PILOT_TEST_CHAT_ID[1:].isdecimal()
+            and str(chat_id) == WEATHER_PILOT_TEST_CHAT_ID
+            and bool(title)
+            and not is_inactive_group_name(title)
+            and bool(re.search(r"(?:^|[\s_-])TEST(?:$|[\s_-])", title, re.IGNORECASE)))
+
+
+async def weatherpilotstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Read-only private admin status; never sends to any group."""
+    if not samsara_private_admin(update):
+        return
+    configured = bool(WEATHER_PILOT_TEST_CHAT_ID)
+    await update.effective_message.reply_text(
+        "BUK SPEAKER | WEATHER TEST PILOT\n"
+        f"Test group configured: {'YES' if configured else 'NO'}\n"
+        "Pilot type: manual simulated message only\n"
+        "Group ID and live group title validated before each test\n"
+        f"Production weather alerts: {'ON' if WEATHER_ENABLED else 'OFF'}\n"
+        "No automatic pilot deliveries. No live NWS warnings sent by pilot.\n"
+        "To test: /weatherpilottest GROUP_CHAT_ID CONFIRM"
+    )
+
+
+async def weatherpilottest_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send exactly one prominently labelled SIMULATION to an allowlisted test group."""
+    if not samsara_private_admin(update):
+        return
+    args = context.args or []
+    if (len(args) != 2 or args[1] != "CONFIRM" or
+            not re.fullmatch(r"-\d{5,20}", args[0])):
+        await update.effective_message.reply_text(
+            "Usage: /weatherpilottest NEGATIVE_TEST_GROUP_ID CONFIRM\n"
+            "This sends ONE simulated weather message to the configured TEST group only."
+        )
+        return
+    requested_id = args[0]
+    # Validate allowlist BEFORE ANY group lookup or sending.
+    if not WEATHER_PILOT_TEST_CHAT_ID or requested_id != WEATHER_PILOT_TEST_CHAT_ID:
+        await update.effective_message.reply_text(
+            "TEST DENIED: this ID is not the FadeHost WEATHER_PILOT_TEST_CHAT_ID allowlist."
+        )
+        return
+    chat_id = int(requested_id)
+    with get_connection() as conn:
+        registered = conn.execute("SELECT 1 FROM groups WHERE chat_id=?", (chat_id,)).fetchone()
+    if not registered:
+        await update.effective_message.reply_text("TEST DENIED: group is not registered with BUK Speaker.")
+        return
+    live = await get_live_group(chat_id, context)
+    if (not live or live.type not in (ChatType.GROUP, ChatType.SUPERGROUP)
+            or not weather_pilot_allowed(chat_id, live.title)):
+        await update.effective_message.reply_text(
+            "TEST DENIED: live Telegram title must clearly contain TEST and must not be inactive."
+        )
+        return
+    # Recheck the title immediately before sending; no group changes or GPS needed.
+    latest = await get_live_group(chat_id, context)
+    if (not latest or latest.type not in (ChatType.GROUP, ChatType.SUPERGROUP)
+            or not weather_pilot_allowed(chat_id, latest.title)):
+        await update.effective_message.reply_text("TEST DENIED: test group verification changed.")
+        return
+    simulation = (
+        "🧪 <b>BUK SPEAKER — WEATHER DELIVERY TEST</b>\n\n"
+        "<b>SIMULATION ONLY — NOT A LIVE WEATHER ALERT</b>\n\n"
+        "🌨️ <b>Example hazard:</b> Winter Weather Advisory (TEST)\n\n"
+        "🚛 <b>Example guidance:</b> Reduce speed and allow extra stopping distance "
+        "when roads are slick. Stop safely if conditions become hazardous.\n\n"
+        "This message tests Telegram delivery and formatting only. "
+        "It does NOT indicate an actual warning or a truck's real location.\n\n"
+        "🔒 Authorized BUK Speaker test group only."
+    )
+    try:
+        sent = await context.bot.send_message(
+            chat_id=chat_id, text=simulation, parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except TelegramError as exc:
+        logger.warning("Weather test pilot delivery failed (%s)", type(exc).__name__)
+        await update.effective_message.reply_text("Test delivery failed. No other groups were contacted.")
+        return
+    context.application.bot_data["weather_pilot_last_sent"] = datetime.now(timezone.utc).isoformat()
+    await update.effective_message.reply_text(
+        f"TEST SENT to approved group: {latest.title}\n"
+        f"Group ID: {chat_id} | Test message ID: {sent.message_id}\n"
+        "This was a simulated message, not a real NWS alert.\n"
+        "Production driver weather alerts remain OFF."
+    )
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2612,6 +2711,8 @@ def main():
     app.add_handler(CommandHandler("groups", groups_command))
     app.add_handler(CommandHandler("samsaraunmatched", samsaraunmatched_command))
     app.add_handler(CommandHandler("weatheradminstatus", weatheradminstatus_command))
+    app.add_handler(CommandHandler("weatherpilotstatus", weatherpilotstatus_command))
+    app.add_handler(CommandHandler("weatherpilottest", weatherpilottest_command))
     app.add_handler(CommandHandler("weathergpsissues", weathergpsissues_command))
     app.add_handler(CommandHandler("gpshealthstatus", gpshealthstatus_command))
     app.add_handler(CommandHandler("weatheradminscan", weatheradminscan_command))
