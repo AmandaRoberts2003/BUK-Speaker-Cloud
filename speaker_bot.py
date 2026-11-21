@@ -403,6 +403,22 @@ def init_database():
             delivered_at TEXT NOT NULL,
             PRIMARY KEY(admin_id, chat_id, alert_id)
         )""")
+        # GPS health episodes and per-admin delivery receipts survive bot restarts.
+        conn.execute("""CREATE TABLE IF NOT EXISTS gps_health_episodes (
+            chat_id INTEGER PRIMARY KEY,
+            vehicle_id TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('issue', 'recovered')),
+            last_checked_at TEXT NOT NULL
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS gps_health_notifications (
+            chat_id INTEGER NOT NULL,
+            episode_started_at TEXT NOT NULL,
+            admin_id INTEGER NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('stale', 'recovered')),
+            delivered_at TEXT NOT NULL,
+            PRIMARY KEY (chat_id, episode_started_at, admin_id, kind)
+        )""")
         # Archive is shared by authorized admins; no Telegram private-chat access is granted.
         conn.execute("""CREATE TABLE IF NOT EXISTS announcements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1706,6 +1722,10 @@ async def weather_scan(context):
 WEATHER_ADMIN_MONITOR_ENABLED = os.getenv("WEATHER_ADMIN_MONITOR_ENABLED", "false").lower() == "true"
 WEATHER_ADMIN_SCAN_SECONDS = max(300, int(os.getenv("WEATHER_ADMIN_SCAN_SECONDS", "600")))
 WEATHER_ADMIN_MAX_GROUPS_PER_SCAN = max(1, min(100, int(os.getenv("WEATHER_ADMIN_MAX_GROUPS_PER_SCAN", "60"))))
+# Admin-only GPS health alerts piggyback on verified weather scans (no extra polling).
+GPS_HEALTH_ADMIN_ALERTS_ENABLED = os.getenv("GPS_HEALTH_ADMIN_ALERTS_ENABLED", "true").lower() == "true"
+GPS_HEALTH_NOTIFY_AFTER_MINUTES = max(60, int(os.getenv("GPS_HEALTH_NOTIFY_AFTER_MINUTES", "60")))
+
 
 
 def _recent_admin_alert(conn, chat_id, event, now):
@@ -1725,11 +1745,130 @@ def _recent_admin_alert(conn, chat_id, event, now):
     return bool(last and timedelta(0) <= now-last < timedelta(hours=6))
 
 
+def gps_health_alert_due(record, issue_started_at, now):
+    """Aged location (>60 min) or missing data observed continuously for 60 min.
+
+    Do not classify missing coordinates, invalid/future timestamps or an
+    unsupported area as stale hardware; those are only data-quality issues.
+    """
+    if not isinstance(record, dict):
+        return False
+    gps = record.get("gps")
+    ts = weather_parse_time(gps.get("time")) if isinstance(gps, dict) else None
+    if ts and timedelta(0) <= now - ts and now - ts > timedelta(minutes=GPS_HEALTH_NOTIFY_AFTER_MINUTES):
+        return True
+    first = weather_parse_time(issue_started_at)
+    return bool(first and now - first >= timedelta(minutes=GPS_HEALTH_NOTIFY_AFTER_MINUTES))
+
+
+async def gps_health_process(app, chat_id, vehicle_id, title, record, now, valid_gps):
+    """Persist one GPS issue episode; send at most one alert and recovery per admin.
+
+    Called only AFTER a live active group and its Samsara unit have matched.
+    No driver-group operations occur here. One monitoring scan lock serializes calls.
+    """
+    outcome = {"gps_health_alerts": 0, "gps_health_recoveries": 0}
+    if not GPS_HEALTH_ADMIN_ALERTS_ENABLED:
+        return outcome
+    now_str = now.isoformat()
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT vehicle_id, started_at, state FROM gps_health_episodes WHERE chat_id=?",
+            (chat_id,),
+        ).fetchone()
+        # If a link was reassigned, never send alerts about the previous truck.
+        if row and row[0] != str(vehicle_id):
+            conn.execute("DELETE FROM gps_health_episodes WHERE chat_id=?", (chat_id,))
+            row = None
+        if valid_gps is None and row is None:
+            conn.execute("""INSERT INTO gps_health_episodes
+                (chat_id, vehicle_id, started_at, state, last_checked_at)
+                VALUES (?,?,?,?,?)""", (chat_id, str(vehicle_id), now_str, "issue", now_str))
+            row = (str(vehicle_id), now_str, "issue")
+        elif row:
+            state = "recovered" if valid_gps is not None else "issue"
+            conn.execute(
+                "UPDATE gps_health_episodes SET state=?,last_checked_at=? WHERE chat_id=?",
+                (state, now_str, chat_id),
+            )
+    if row is None:
+        return outcome
+    _, episode, _ = row
+    if valid_gps is None:
+        if not gps_health_alert_due(record, episode, now):
+            return outcome
+        reason, stamp = gps_diagnostic_reason(record, now)
+        message = (
+            "🔒 BUK SPEAKER | GPS DATA NEEDS REVIEW\n\n"
+            f"🚛 Unit: {vehicle_unit_from_name(record.get('name')) or 'Unknown'}\n"
+            f"Group: {title}\n"
+            f"Issue: {reason or 'GPS unavailable'}\n"
+            f"Last GPS: {stamp or 'Unavailable'}\n\n"
+            "This is a stale/missing location-data notice, not evidence of a device "
+            "failure or an unsafe driver. Parked/offline vehicles may stop updating. "
+            "Check Samsara status when practical. No alert was sent to drivers."
+        )
+        kind = "stale"
+    else:
+        # Only send recovery if an admin actually received a prior stale notice.
+        message = (
+            "✅ BUK SPEAKER | GPS DATA RECOVERED\n\n"
+            f"🚛 Unit: {vehicle_unit_from_name(record.get('name')) or 'Unknown'}\n"
+            f"Group: {title}\n"
+            "A fresh usable GPS position is available again. Weather checks can resume. "
+            "No message was sent to drivers."
+        )
+        kind = "recovered"
+    for admin_id in sorted(ADMIN_USER_IDS):
+        with get_connection() as conn:
+            delivered = conn.execute(
+                """SELECT 1 FROM gps_health_notifications
+                WHERE chat_id=? AND episode_started_at=? AND admin_id=? AND kind=?""",
+                (chat_id, episode, admin_id, kind),
+            ).fetchone()
+            had_stale = conn.execute(
+                """SELECT 1 FROM gps_health_notifications
+                WHERE chat_id=? AND episode_started_at=? AND admin_id=? AND kind='stale'""",
+                (chat_id, episode, admin_id),
+            ).fetchone()
+        if delivered or (kind == "recovered" and not had_stale):
+            continue
+        try:
+            await app.bot.send_message(chat_id=admin_id, text=message)
+        except TelegramError as exc:
+            logger.warning("Private GPS health notification failed (%s)", type(exc).__name__)
+            continue
+        with get_connection() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO gps_health_notifications
+                   (chat_id,episode_started_at,admin_id,kind,delivered_at)
+                   VALUES (?,?,?,?,?)""",
+                (chat_id, episode, admin_id, kind, now_str),
+            )
+        outcome["gps_health_alerts" if kind == "stale" else "gps_health_recoveries"] += 1
+    if valid_gps is not None:
+        # Once recovery has reached each previously-alerted admin, close episode.
+        with get_connection() as conn:
+            outstanding = conn.execute(
+                """SELECT COUNT(*) FROM gps_health_notifications n
+                   WHERE n.chat_id=? AND n.episode_started_at=? AND n.kind='stale'
+                     AND NOT EXISTS (
+                       SELECT 1 FROM gps_health_notifications r
+                       WHERE r.chat_id=n.chat_id AND r.episode_started_at=n.episode_started_at
+                         AND r.admin_id=n.admin_id AND r.kind='recovered')""",
+                (chat_id, episode),
+            ).fetchone()[0]
+            if outstanding == 0:
+                conn.execute("DELETE FROM gps_health_episodes WHERE chat_id=?", (chat_id,))
+    return outcome
+
+
 async def run_weather_admin_scan(app):
     """Observe only, NEVER post to a driver group. Fail closed on uncertain data."""
     summary = {"checked": 0, "fresh": 0, "stale": 0, "inactive": 0,
                "unverified": 0, "alerts": 0, "admin_messages": 0,
-               "nws_failed": 0, "duplicate": 0, "error": None, "limited": 0}
+               "nws_failed": 0, "duplicate": 0, "error": None, "limited": 0,
+               "gps_health_alerts": 0, "gps_health_recoveries": 0}
     lock = app.bot_data.setdefault("weather_admin_scan_lock", asyncio.Lock())
     if lock.locked():
         summary["error"] = "Scan already running"
@@ -1764,6 +1903,9 @@ async def run_weather_admin_scan(app):
                 summary["unverified"] += 1
                 continue
             valid_gps = samsara_valid_gps(record.get("gps"), now=now)
+            health = await gps_health_process(app, chat_id, vehicle_id, live.title, record, now, valid_gps)
+            for health_key, count in health.items():
+                summary[health_key] += count
             if valid_gps is None:
                 summary["stale"] += 1
                 continue
@@ -1945,6 +2087,8 @@ async def weatheradminstatus_command(update: Update, context: ContextTypes.DEFAU
         f"Administrator alert records: {tracked}\n"
         f"Last scan: {context.application.bot_data.get('weather_admin_last_scan', 'none')}\n"
         f"Last result: {result or 'none'}\n"
+        f"Private GPS health alerts: {'ON' if GPS_HEALTH_ADMIN_ALERTS_ENABLED else 'OFF'} "
+        f"(after {GPS_HEALTH_NOTIFY_AFTER_MINUTES} minutes)\n"
         "Weather messages to driver groups: OFF (hard-disabled)."
     )
 
@@ -1964,6 +2108,8 @@ async def weatheradminscan_command(update: Update, context: ContextTypes.DEFAULT
         f"New qualifying alerts: {summary['alerts']} | Duplicates suppressed: {summary['duplicate']}\n"
         f"Administrator copies delivered: {summary['admin_messages']}\n"
         f"Not scanned (pilot limit): {summary['limited']}\n"
+        f"GPS health admin alerts: {summary['gps_health_alerts']} | "
+        f"GPS recovery notices: {summary['gps_health_recoveries']}\n"
         f"Status: {summary['error'] or 'Complete'}\n"
         "Driver-group weather notifications: OFF."
     )
@@ -2126,7 +2272,7 @@ async def samsaraunmatched_command(update: Update, context: ContextTypes.DEFAULT
             "Unmatched report failed. Check FadeHost logs for 'Unmatched fleet report command failed'.")
 
 
-SPEAKER_BUILD = "2026-11-20-gps-diagnostics-v20"
+SPEAKER_BUILD = "2026-11-20-gps-health-v21"
 
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
