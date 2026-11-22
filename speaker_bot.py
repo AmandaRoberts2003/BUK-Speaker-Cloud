@@ -2491,9 +2491,9 @@ async def weather_post_init(app):
         logger.info("Private Samsara/NWS monitor enabled; interval %s seconds", WEATHER_ADMIN_SCAN_SECONDS)
     if driver_weather_enabled():
         app.bot_data["weather_driver_task"] = asyncio.create_task(driver_weather_loop(app))
-        logger.warning("Real driver weather delivery ENABLED for explicit allowlist, interval %ss", WEATHER_DRIVER_SCAN_SECONDS)
+        logger.warning("Real driver weather delivery ENABLED for %s, interval %ss", WEATHER_DRIVER_ENROLLMENT_MODE, WEATHER_DRIVER_SCAN_SECONDS)
     else:
-        logger.info("Real driver weather delivery OFF: explicit approval and allowlist required")
+        logger.info("Real driver weather delivery OFF: explicit approval / enrollment not enabled")
     if WEATHER_ENABLED:
         app.bot_data["weather_task"] = asyncio.create_task(weather_loop(app))
         logger.info("Official NWS monitoring enabled, interval %ss", WEATHER_POLL_SECONDS)
@@ -2635,7 +2635,7 @@ async def samsaraunmatched_command(update: Update, context: ContextTypes.DEFAULT
             "Unmatched report failed. Check FadeHost logs for 'Unmatched fleet report command failed'.")
 
 
-SPEAKER_BUILD = "2026-11-22-obsolete-group-cleanup-v29"
+SPEAKER_BUILD = "2026-11-22-verified-fleet-enrollment-v30"
 
 
 # V23: MANUAL, EXPLICITLY-APPROVED TEST-GROUP ONLY PILOT.
@@ -3301,13 +3301,35 @@ WEATHER_DRIVER_DELIVERY_ENABLED = os.getenv("WEATHER_DRIVER_DELIVERY_ENABLED", "
 WEATHER_DRIVER_APPROVAL = os.getenv("WEATHER_DRIVER_APPROVAL", "").strip()
 WEATHER_DRIVER_APPROVAL_TEXT = "I_APPROVE_LIVE_DRIVER_WEATHER_ALERTS"
 WEATHER_DRIVER_CHAT_IDS_RAW = os.getenv("WEATHER_DRIVER_CHAT_IDS", "").strip()
+# v30: optional DYNAMIC enrollment for uniquely linked active Samsara groups.
+# Manual allowlist remains the default. The new fleet-wide permission is separate
+# from the existing individual-group approval and remains OFF on installation.
+WEATHER_DRIVER_ENROLLMENT_MODE = os.getenv("WEATHER_DRIVER_ENROLLMENT_MODE", "manual").strip().lower()
+WEATHER_DRIVER_FLEET_APPROVAL = os.getenv("WEATHER_DRIVER_FLEET_APPROVAL", "").strip()
+WEATHER_DRIVER_FLEET_APPROVAL_TEXT = "I_APPROVE_VERIFIED_FLEET_AUTO_ENROLLMENT"
 WEATHER_DRIVER_SCAN_SECONDS = max(300, int(os.getenv("WEATHER_DRIVER_SCAN_SECONDS", "600")))
 WEATHER_DRIVER_MAX_GROUPS_PER_CYCLE = max(1, min(50, int(os.getenv("WEATHER_DRIVER_MAX_GROUPS_PER_CYCLE", "50"))))
 WEATHER_DRIVER_MAX_ALERTS_PER_CYCLE = max(1, min(20, int(os.getenv("WEATHER_DRIVER_MAX_ALERTS_PER_CYCLE", "5"))))
 
 
 def driver_allowlist():
-    """Strictly validate destinations. Invalid syntax locks delivery globally."""
+    """Candidate destinations: static manual IDs or dynamic linked registrations.
+
+    Database membership is NEVER sufficient to send: live Telegram group titles,
+    duplicate-unit veto, Samsara unit match and fresh GPS are rechecked on every
+    cycle and again immediately before any production delivery.
+    """
+    if WEATHER_DRIVER_ENROLLMENT_MODE not in ("manual", "verified_fleet"):
+        return set(), "Invalid WEATHER_DRIVER_ENROLLMENT_MODE (manual/verified_fleet only)"
+    if WEATHER_DRIVER_ENROLLMENT_MODE == "verified_fleet":
+        with get_connection() as conn:
+            rows = conn.execute("""SELECT l.chat_id, g.group_name
+                FROM samsara_group_links l JOIN groups g ON g.chat_id=l.chat_id""").fetchall()
+        # Cached title only narrows candidates, never authorizes a delivery.
+        # Never enroll test groups or inactive groups, even if linked by mistake.
+        return {chat_id for chat_id, title in rows
+                if group_unit_from_title(title)
+                and str(chat_id) != WEATHER_PILOT_TEST_CHAT_ID}, None
     if not WEATHER_DRIVER_CHAT_IDS_RAW:
         return set(), None
     ids = set()
@@ -3321,9 +3343,26 @@ def driver_allowlist():
 
 def driver_weather_enabled():
     ids, err = driver_allowlist()
-    return bool(WEATHER_DRIVER_DELIVERY_ENABLED and
-                WEATHER_DRIVER_APPROVAL == WEATHER_DRIVER_APPROVAL_TEXT and
-                ids and not err)
+    if err or not ids or not WEATHER_DRIVER_DELIVERY_ENABLED:
+        return False
+    if WEATHER_DRIVER_ENROLLMENT_MODE == "verified_fleet":
+        return bool(WEATHER_DRIVER_FLEET_APPROVAL == WEATHER_DRIVER_FLEET_APPROVAL_TEXT
+                    and SAMSARA_AUTO_ONBOARD_ENABLED)
+    return WEATHER_DRIVER_APPROVAL == WEATHER_DRIVER_APPROVAL_TEXT
+
+
+def driver_candidate_window(app, candidates, dry_run):
+    """Round-robin bounded scanning: fleets >50 are covered across cycles."""
+    ordered = sorted(candidates)
+    if not ordered:
+        return [], 0
+    count = min(len(ordered), WEATHER_DRIVER_MAX_GROUPS_PER_CYCLE)
+    if dry_run or WEATHER_DRIVER_ENROLLMENT_MODE != "verified_fleet":
+        return ordered[:count], max(0, len(ordered) - count)
+    offset = int(app.bot_data.get("weather_driver_round_robin_offset", 0)) % len(ordered)
+    window = [ordered[(offset + index) % len(ordered)] for index in range(count)]
+    app.bot_data["weather_driver_round_robin_offset"] = (offset + count) % len(ordered)
+    return window, len(ordered) - count
 
 
 def driver_nws_eligible(info, now):
@@ -3415,7 +3454,8 @@ async def driver_weather_cycle(app, dry_run=False):
             result["error"] = "Samsara/Telegram inventory unavailable"
             return result
         now = datetime.now(timezone.utc)
-        for chat_id in sorted(allow)[:WEATHER_DRIVER_MAX_GROUPS_PER_CYCLE]:
+        selected, deferred = driver_candidate_window(app, allow, dry_run)
+        for chat_id in selected:
             vid = links.get(chat_id)
             if not vid or chat_id not in live_titles:
                 result["blocked"] += 1
@@ -3520,9 +3560,10 @@ async def driver_weather_cycle(app, dry_run=False):
                         (datetime.now(timezone.utc).isoformat(), chat_id, info["id"]))
                 result["sent"] += 1
             await asyncio.sleep(0.15)
-        if len(allow) > WEATHER_DRIVER_MAX_GROUPS_PER_CYCLE:
+        if deferred:
             result["detail"].append(
-                f"{len(allow)-WEATHER_DRIVER_MAX_GROUPS_PER_CYCLE} allowlisted groups beyond per-cycle cap NOT checked")
+                f"{deferred} additional candidate groups NOT checked this cycle; "
+                + ("next automatic cycles rotate through them" if WEATHER_DRIVER_ENROLLMENT_MODE == "verified_fleet" else "increase the configured scan limit to include them"))
     app.bot_data["weather_driver_last_result"] = {k: v for k,v in result.items() if k != "detail"}
     app.bot_data["weather_driver_last_run"] = datetime.now(timezone.utc).isoformat()
     return result
@@ -3547,7 +3588,9 @@ async def weatherdriverstatus_command(update: Update, context: ContextTypes.DEFA
     await update.effective_message.reply_text(
         "BUK SPEAKER | LIVE DRIVER WEATHER SAFETY GATE\n"
         f"Driver delivery: {'ON (explicit opt-in)' if driver_weather_enabled() else 'OFF (safe default)'}\n"
-        f"Explicit groups allowlisted: {len(allow)}\n"
+        f"Enrollment mode: {WEATHER_DRIVER_ENROLLMENT_MODE}\n"
+        f"{'Linked candidate groups' if WEATHER_DRIVER_ENROLLMENT_MODE == 'verified_fleet' else 'Explicit groups allowlisted'}: {len(allow)}\n"
+        f"Fleet enrollment approval: {'YES' if WEATHER_DRIVER_FLEET_APPROVAL == WEATHER_DRIVER_FLEET_APPROVAL_TEXT else 'NO'}\n"
         f"Configuration: {err or 'valid'}\n"
         f"Check interval: {WEATHER_DRIVER_SCAN_SECONDS//60} minutes\n"
         f"Max scanned per cycle: {WEATHER_DRIVER_MAX_GROUPS_PER_CYCLE}\n"
