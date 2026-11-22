@@ -668,6 +668,76 @@ async def groupforget_command(update: Update, context: ContextTypes.DEFAULT_TYPE
             "No message sent to any group.")
 
 
+async def groupforgetobsolete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Archive obsolete unlinked registration when a live unlinked replacement exists.
+
+    Explicit admin confirmation and BOTH exact chat IDs required. An old group
+    that remains live and active must not be removed by this command. This never
+    links vehicles or contacts drivers and never modifies the replacement.
+    """
+    if not samsara_private_admin(update):
+        return
+    usage = "Usage: /groupforgetobsolete OLD_GROUP_ID KEEP_GROUP_ID CONFIRM"
+    if len(context.args) != 3 or context.args[2] != "CONFIRM":
+        await update.effective_message.reply_text(usage)
+        return
+    try:
+        old_id, keep_id = int(context.args[0]), int(context.args[1])
+    except ValueError:
+        await update.effective_message.reply_text("Invalid group ID. Nothing changed.")
+        return
+    if old_id == keep_id or old_id >= 0 or keep_id >= 0:
+        await update.effective_message.reply_text("REFUSED: provide two distinct Telegram group IDs.")
+        return
+    with get_connection() as conn:
+        old = conn.execute("SELECT group_name FROM groups WHERE chat_id=?", (old_id,)).fetchone()
+        kept = conn.execute("SELECT group_name FROM groups WHERE chat_id=?", (keep_id,)).fetchone()
+        old_link = conn.execute("SELECT 1 FROM samsara_group_links WHERE chat_id=?", (old_id,)).fetchone()
+    if not old or not kept or old_link:
+        await update.effective_message.reply_text(
+            "REFUSED: both registrations must exist and the old group must be UNLINKED. Nothing changed.")
+        return
+    old_unit = group_unit_from_title(old[0])
+    keep_unit = group_unit_from_title(kept[0])
+    if not old_unit or old_unit != keep_unit:
+        await update.effective_message.reply_text(
+            "REFUSED: old and replacement group titles do not have the same active unit. Nothing changed.")
+        return
+    # Replacement must be verified LIVE and currently active. Cached title alone
+    # is never permission to archive a different unit's group.
+    live_keep = await get_live_group(keep_id, context)
+    if (not live_keep or live_keep.type not in (ChatType.GROUP, ChatType.SUPERGROUP)
+            or group_unit_from_title(live_keep.title) != keep_unit):
+        await update.effective_message.reply_text(
+            "REFUSED: the replacement group is not live, active, and unit-matched. Nothing changed.")
+        return
+    # Inaccessible OLD group is a stale registration; inactive OLD group is
+    # intentionally retired. If it is still a live active group, do not guess.
+    live_old = await get_live_group(old_id, context)
+    if live_old and live_old.type in (ChatType.GROUP, ChatType.SUPERGROUP) and live_old.title:
+        if not is_inactive_group_name(live_old.title):
+            await update.effective_message.reply_text(
+                "REFUSED: old group is still accessible and ACTIVE in Telegram. "
+                "Rename it Inactive or remove BUK Speaker from that old group first.")
+            return
+    # Recheck links and registrations immediately before archival; no writes to
+    # replacement chat or to any weather-delivery records.
+    with get_connection() as conn:
+        if conn.execute("SELECT 1 FROM samsara_group_links WHERE chat_id=?", (old_id,)).fetchone():
+            await update.effective_message.reply_text("REFUSED: old group became linked. Nothing changed.")
+            return
+        if not conn.execute("SELECT 1 FROM groups WHERE chat_id=?", (keep_id,)).fetchone():
+            await update.effective_message.reply_text("REFUSED: replacement registration disappeared.")
+            return
+    if archive_group_registration(old_id, "admin-confirmed-obsolete-unlinked", update.effective_user.id):
+        await update.effective_message.reply_text(
+            f"ARCHIVED obsolete group {old_id}. Kept active Unit {keep_unit} group {keep_id}. "
+            "Historical audits retained. No driver messages sent. "
+            "Samsara linking remains separate and requires a verified vehicle.")
+    else:
+        await update.effective_message.reply_text("Group was already archived; no changes needed.")
+
+
 async def on_bot_membership_change(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Register joining groups; archive only when Telegram confirms bot removal."""
     membership = update.my_chat_member
@@ -2565,7 +2635,7 @@ async def samsaraunmatched_command(update: Update, context: ContextTypes.DEFAULT
             "Unmatched report failed. Check FadeHost logs for 'Unmatched fleet report command failed'.")
 
 
-SPEAKER_BUILD = "2026-11-22-group-registry-cleanup-v28"
+SPEAKER_BUILD = "2026-11-22-obsolete-group-cleanup-v29"
 
 
 # V23: MANUAL, EXPLICITLY-APPROVED TEST-GROUP ONLY PILOT.
@@ -3538,6 +3608,7 @@ def main():
     app.add_handler(CommandHandler("samsaraautoscan", samsaraautoscan_command))
     app.add_handler(CommandHandler("groups", groups_command))
     app.add_handler(CommandHandler("groupforget", groupforget_command))
+    app.add_handler(CommandHandler("groupforgetobsolete", groupforgetobsolete_command))
     app.add_handler(CommandHandler("samsaraunmatched", samsaraunmatched_command))
     app.add_handler(CommandHandler("weatheradminstatus", weatheradminstatus_command))
     app.add_handler(CommandHandler("weatherpilotstatus", weatherpilotstatus_command))
