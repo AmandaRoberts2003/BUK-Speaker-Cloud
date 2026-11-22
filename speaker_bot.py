@@ -62,6 +62,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger("buk_speaker")
 
+# Hide the Telegram bot credential even if a third-party HTTP logger includes
+# it in a request URL. Keep this filter on active handlers, not only root logger.
+class _RedactTelegramToken(logging.Filter):
+    def filter(self, record):
+        if BOT_TOKEN:
+            try:
+                rendered = record.getMessage()
+                if BOT_TOKEN in rendered:
+                    record.msg = rendered.replace(BOT_TOKEN, "[REDACTED_BOT_TOKEN]")
+                    record.args = ()
+            except Exception:
+                pass
+        return True
+
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_RedactTelegramToken())
+
 WELCOME_MESSAGE = """📢 Dear BUK Drivers,
 
 To make communication faster, cleaner, and a little less chaotic, we have officially introduced BUK Speaker to your individual group chats.
@@ -439,6 +456,18 @@ def init_database():
             created_at TEXT NOT NULL,
             sent_at TEXT,
             PRIMARY KEY(destination_chat_id, scenario, build)
+        )""")
+        # Production NWS audit. Pending records intentionally block automatic replay
+        # after any ambiguous/partial Telegram network delivery.
+        conn.execute("""CREATE TABLE IF NOT EXISTS weather_driver_deliveries (
+            chat_id INTEGER NOT NULL,
+            vehicle_id TEXT NOT NULL,
+            alert_id TEXT NOT NULL,
+            event TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('pending','sent')),
+            created_at TEXT NOT NULL,
+            sent_at TEXT,
+            PRIMARY KEY(chat_id, alert_id)
         )""")
         # Archive is shared by authorized admins; no Telegram private-chat access is granted.
         conn.execute("""CREATE TABLE IF NOT EXISTS announcements (
@@ -2264,7 +2293,7 @@ async def weatheradminstatus_command(update: Update, context: ContextTypes.DEFAU
         f"Last result: {result or 'none'}\n"
         f"Private GPS health alerts: {'ON' if GPS_HEALTH_ADMIN_ALERTS_ENABLED else 'OFF'} "
         f"(after {GPS_HEALTH_NOTIFY_AFTER_MINUTES} minutes)\n"
-        "Weather messages to driver groups: OFF (hard-disabled)."
+        f"Actual driver weather delivery: {'ON (explicit opt-in)' if driver_weather_enabled() else 'OFF (safe default)'}."
     )
 
 
@@ -2306,6 +2335,11 @@ async def weather_post_init(app):
     if WEATHER_ADMIN_MONITOR_ENABLED:
         app.bot_data["weather_admin_task"] = asyncio.create_task(weather_admin_loop(app))
         logger.info("Private Samsara/NWS monitor enabled; interval %s seconds", WEATHER_ADMIN_SCAN_SECONDS)
+    if driver_weather_enabled():
+        app.bot_data["weather_driver_task"] = asyncio.create_task(driver_weather_loop(app))
+        logger.warning("Real driver weather delivery ENABLED for explicit allowlist, interval %ss", WEATHER_DRIVER_SCAN_SECONDS)
+    else:
+        logger.info("Real driver weather delivery OFF: explicit approval and allowlist required")
     if WEATHER_ENABLED:
         app.bot_data["weather_task"] = asyncio.create_task(weather_loop(app))
         logger.info("Official NWS monitoring enabled, interval %ss", WEATHER_POLL_SECONDS)
@@ -2314,7 +2348,7 @@ async def weather_post_init(app):
 
 
 async def weather_post_shutdown(app):
-    for name in ("samsara_auto_task", "weather_admin_task", "weather_task"):
+    for name in ("samsara_auto_task", "weather_admin_task", "weather_driver_task", "weather_task"):
         task = app.bot_data.get(name)
         if task:
             task.cancel()
@@ -2447,7 +2481,7 @@ async def samsaraunmatched_command(update: Update, context: ContextTypes.DEFAULT
             "Unmatched report failed. Check FadeHost logs for 'Unmatched fleet report command failed'.")
 
 
-SPEAKER_BUILD = "2026-11-21-weather-readiness-audit-v26"
+SPEAKER_BUILD = "2026-11-21-complete-weather-controls-v27"
 
 
 # V23: MANUAL, EXPLICITLY-APPROVED TEST-GROUP ONLY PILOT.
@@ -2862,7 +2896,7 @@ async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Media broadcasting: enabled\n"
         "Shared announcement history: enabled\n"
         "Automatic admin broadcast sharing: enabled\n"
-        f"NWS weather monitoring: {'ON' if WEATHER_ENABLED else 'OFF (safe default)'}\n"
+        f"NWS weather monitoring: {'ON' if WEATHER_ENABLED else 'OFF (safe default)'}\n"        f"Actual driver weather delivery: {'ON (explicit opt-in)' if driver_weather_enabled() else 'OFF (safe default)'}\n"
         f"Authorized admins: {len(ADMIN_USER_IDS)}\n"
         f"Samsara auto-onboarding: {'ON' if SAMSARA_AUTO_ONBOARD_ENABLED else 'OFF'}\n"
         f"Samsara private weather monitoring: {'ON' if WEATHER_ADMIN_MONITOR_ENABLED else 'OFF (manual scan available)'}\n"
@@ -3101,6 +3135,303 @@ async def announcement_command(update: Update, context: ContextTypes.DEFAULT_TYP
             await update.effective_message.reply_text(body or "[No media reference available]")
 
 
+
+# V27 SINGLE-FILE RELEASE: production route is complete but opt-in ONLY.
+# An installation or migration NEVER enables real driver delivery.
+# Activation requires three exact settings AND an individual group allowlist:
+# WEATHER_DRIVER_DELIVERY_ENABLED=true
+# WEATHER_DRIVER_APPROVAL=I_APPROVE_LIVE_DRIVER_WEATHER_ALERTS
+# WEATHER_DRIVER_CHAT_IDS=-100..., -100...
+# NOTE: Never list test-group chat IDs here. This feature is not a fleet broadcast.
+WEATHER_DRIVER_DELIVERY_ENABLED = os.getenv("WEATHER_DRIVER_DELIVERY_ENABLED", "false").strip().lower() == "true"
+WEATHER_DRIVER_APPROVAL = os.getenv("WEATHER_DRIVER_APPROVAL", "").strip()
+WEATHER_DRIVER_APPROVAL_TEXT = "I_APPROVE_LIVE_DRIVER_WEATHER_ALERTS"
+WEATHER_DRIVER_CHAT_IDS_RAW = os.getenv("WEATHER_DRIVER_CHAT_IDS", "").strip()
+WEATHER_DRIVER_SCAN_SECONDS = max(300, int(os.getenv("WEATHER_DRIVER_SCAN_SECONDS", "600")))
+WEATHER_DRIVER_MAX_GROUPS_PER_CYCLE = max(1, min(50, int(os.getenv("WEATHER_DRIVER_MAX_GROUPS_PER_CYCLE", "50"))))
+WEATHER_DRIVER_MAX_ALERTS_PER_CYCLE = max(1, min(20, int(os.getenv("WEATHER_DRIVER_MAX_ALERTS_PER_CYCLE", "5"))))
+
+
+def driver_allowlist():
+    """Strictly validate destinations. Invalid syntax locks delivery globally."""
+    if not WEATHER_DRIVER_CHAT_IDS_RAW:
+        return set(), None
+    ids = set()
+    for token in WEATHER_DRIVER_CHAT_IDS_RAW.split(","):
+        token = token.strip()
+        if not re.fullmatch(r"-100[0-9]{5,16}", token):
+            return set(), "Invalid WEATHER_DRIVER_CHAT_IDS; expected -100... supergroup IDs"
+        ids.add(int(token))
+    return ids, None
+
+
+def driver_weather_enabled():
+    ids, err = driver_allowlist()
+    return bool(WEATHER_DRIVER_DELIVERY_ENABLED and
+                WEATHER_DRIVER_APPROVAL == WEATHER_DRIVER_APPROVAL_TEXT and
+                ids and not err)
+
+
+def driver_nws_eligible(info, now):
+    """Fresh official product, not a future-onset product, with verified fields."""
+    return bool(info and info.get("id") and info.get("event") in WEATHER_EVENTS and
+                isinstance(info.get("starts"), datetime) and info["starts"] <= now and
+                isinstance(info.get("expires"), datetime) and info["expires"] > now)
+
+
+def driver_destination_precheck(chat_id, live_title, vehicle_id, record, group_unit_counts, now):
+    """Independent fail-closed verifier used by both dry-runs and actual sends."""
+    ids, err = driver_allowlist()
+    if err or chat_id not in ids:
+        return "BLOCK", "Not in approved destination allowlist"
+    if str(chat_id) == WEATHER_PILOT_TEST_CHAT_ID:
+        return "BLOCK", "TEST destination prohibited"
+    if not live_title or is_inactive_group_name(live_title):
+        return "BLOCK", "Group unverified or inactive"
+    unit = group_unit_from_title(live_title)
+    if not unit or group_unit_counts.get(unit, 0) != 1:
+        return "BLOCK", "Group unit missing or duplicated"
+    if not isinstance(record, dict) or vehicle_unit_from_name(record.get("name")) != unit:
+        return "BLOCK", "Samsara unit mismatch or missing"
+    if samsara_valid_gps(record.get("gps"), now=now) is None:
+        return "GPS_HOLD", "GPS not fresh and usable"
+    return "READY", unit
+
+
+async def driver_snapshot_check(app):
+    """Get live inventory and GPS once; fail closed if any registered group is unreadable.
+
+    A cached title is only used to identify possible conflicts, never authorize.
+    A known unreadable group with the same cached unit blocks that unit.
+    """
+    vehicles = await asyncio.to_thread(samsara_get_gps_snapshot)
+    with get_connection() as conn:
+        links = dict(conn.execute("SELECT chat_id,vehicle_id FROM samsara_group_links").fetchall())
+        groups = conn.execute("SELECT chat_id,group_name FROM groups").fetchall()
+    live = {}
+    possible_units = {}
+    unknown_units = set()
+    for chat_id, cached_title in groups:
+        chat = await get_live_group(chat_id, app)
+        title = (chat.title if chat and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP) else None)
+        live[chat_id] = title
+        if title is None:
+            cached_unit = group_unit_from_title(cached_title)
+            if cached_unit:
+                unknown_units.add(cached_unit)
+        else:
+            unit = group_unit_from_title(title)
+            if unit:
+                possible_units[unit] = possible_units.get(unit, 0) + 1
+    for unit in unknown_units:
+        possible_units[unit] = max(2, possible_units.get(unit, 0))
+    return vehicles, links, live, possible_units
+
+
+async def driver_weather_cycle(app, dry_run=False):
+    """Safely review allowlisted groups; optionally send real live NWS products.
+
+    Exact ID + per-event advisory quiet period, fresh GPS, fresh NWS onset and
+    expiry, live Telegram title checks, and persistent pre-send reservation.
+    No automatic retry of ambiguous partial deliveries.
+    """
+    result = {"mode": "DRY_RUN" if dry_run else "LIVE", "ready": 0,
+              "gps_hold": 0, "blocked": 0, "warnings": 0,
+              "sent": 0, "duplicates": 0, "nws_failed": 0,
+              "pending_review": 0, "detail": [], "error": None}
+    allow, err = driver_allowlist()
+    if err:
+        result["error"] = err
+        return result
+    if not allow:
+        result["error"] = "No specific driver groups allowlisted"
+        return result
+    if not dry_run and not driver_weather_enabled():
+        result["error"] = "Live delivery disabled: approval switches not configured"
+        return result
+    lock = app.bot_data.setdefault("weather_driver_cycle_lock", asyncio.Lock())
+    if lock.locked():
+        result["error"] = "Driver weather cycle already running"
+        return result
+    async with lock:
+        try:
+            vehicles, links, live_titles, counts = await driver_snapshot_check(app)
+        except Exception as exc:
+            logger.warning("Driver weather evaluation blocked (%s)", type(exc).__name__)
+            result["error"] = "Samsara/Telegram inventory unavailable"
+            return result
+        now = datetime.now(timezone.utc)
+        for chat_id in sorted(allow)[:WEATHER_DRIVER_MAX_GROUPS_PER_CYCLE]:
+            vid = links.get(chat_id)
+            if not vid or chat_id not in live_titles:
+                result["blocked"] += 1
+                result["detail"].append(f"{chat_id}: BLOCK (missing verified link/registration)")
+                continue
+            rec = vehicles.get(str(vid))
+            state, explanation = driver_destination_precheck(chat_id, live_titles[chat_id], vid, rec, counts, now)
+            if state != "READY":
+                result["gps_hold" if state == "GPS_HOLD" else "blocked"] += 1
+                result["detail"].append(f"{chat_id}: {state} ({explanation})")
+                continue
+            unit = explanation
+            result["ready"] += 1
+            lat, lon, _ = samsara_valid_gps(rec.get("gps"), now=now)
+            try:
+                features = await asyncio.to_thread(nws_get_active_point, lat, lon)
+            except Exception as exc:
+                logger.warning("Driver NWS point lookup skipped (%s)", type(exc).__name__)
+                result["nws_failed"] += 1
+                continue
+            for feature in features:
+                info = weather_active_record(feature, now=now)
+                if not driver_nws_eligible(info, now):
+                    continue
+                result["warnings"] += 1
+                with get_connection() as conn:
+                    existing = conn.execute(
+                        "SELECT state FROM weather_driver_deliveries WHERE chat_id=? AND alert_id=?",
+                        (chat_id, info["id"])).fetchone()
+                    # Advisory updates from NWS may have new IDs; throttle routine advisories only.
+                    recent_advisory = None
+                    if info["event"] in GENERAL_ADVISORY_EVENTS:
+                        recent_advisory = conn.execute(
+                            "SELECT MAX(sent_at) FROM weather_driver_deliveries "
+                            "WHERE chat_id=? AND event=? AND state='sent'",
+                            (chat_id, info["event"])).fetchone()[0]
+                prior_time = weather_parse_time(recent_advisory) if recent_advisory else None
+                if existing or (prior_time and timedelta(0) <= now-prior_time < timedelta(hours=12)):
+                    result["duplicates"] += 1
+                    if existing and existing[0] == "pending":
+                        result["pending_review"] += 1
+                    continue
+                result["detail"].append(f"Unit {unit}: {info['event']} (new active NWS alert)")
+                if dry_run:
+                    continue
+                if result["sent"] >= WEATHER_DRIVER_MAX_ALERTS_PER_CYCLE:
+                    result["detail"].append("Per-cycle delivery budget reached; remaining alerts withheld")
+                    break
+                # Recheck exact group ID, exact unit and fresh GPS immediately before delivery.
+                latest_group = await get_live_group(chat_id, app)
+                if not latest_group or latest_group.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+                    result["blocked"] += 1
+                    continue
+                fresh_now = datetime.now(timezone.utc)
+                state2, _ = driver_destination_precheck(chat_id, latest_group.title, vid, rec, counts, fresh_now)
+                if (state2 != "READY" or not driver_nws_eligible(info, fresh_now)
+                        or not driver_weather_enabled()):
+                    result["blocked"] += 1
+                    continue
+                with get_connection() as conn:
+                    current_link = conn.execute(
+                        "SELECT vehicle_id FROM samsara_group_links WHERE chat_id=?", (chat_id,)).fetchone()
+                if not current_link or str(current_link[0]) != str(vid):
+                    result["blocked"] += 1
+                    continue
+                # Durable reservation must commit before sending. Never replay a pending record.
+                try:
+                    with get_connection() as conn:
+                        conn.execute("""INSERT INTO weather_driver_deliveries
+                            (chat_id,vehicle_id,alert_id,event,state,created_at)
+                            VALUES (?,?,?,?,?,?)""",
+                            (chat_id, str(vid), info["id"], info["event"], "pending", fresh_now.isoformat()))
+                except sqlite3.IntegrityError:
+                    result["duplicates"] += 1
+                    continue
+                # Safe one-message envelope: no partial multi-part delivery ambiguity.
+                # Long official region lists are in the full NWS alert; a long message
+                # is withheld rather than truncated or misleadingly delivered.
+                try:
+                    tz = await asyncio.to_thread(nws_get_point_timezone, lat, lon)
+                except Exception:
+                    tz = None
+                parts = weather_message_parts(info, unit=unit, timezone_name=tz)
+                if len(parts) != 1:
+                    result["pending_review"] += 1
+                    logger.warning("NWS driver alert withheld: multi-part region (chat %s)", chat_id)
+                    continue
+                msg = parts[0] + "\n\n<i>BUK Transportation automated notice. Confirm current conditions with official authorities and Dispatch.</i>"
+                if len(msg) >= 4096:
+                    result["pending_review"] += 1
+                    continue
+                try:
+                    await app.bot.send_message(chat_id=chat_id, text=msg,
+                                               parse_mode="HTML", disable_web_page_preview=True)
+                except TelegramError as exc:
+                    logger.warning("NWS driver send uncertain; marked for review (%s)", type(exc).__name__)
+                    result["pending_review"] += 1
+                    continue
+                with get_connection() as conn:
+                    conn.execute("""UPDATE weather_driver_deliveries
+                        SET state='sent', sent_at=? WHERE chat_id=? AND alert_id=?""",
+                        (datetime.now(timezone.utc).isoformat(), chat_id, info["id"]))
+                result["sent"] += 1
+            await asyncio.sleep(0.15)
+        if len(allow) > WEATHER_DRIVER_MAX_GROUPS_PER_CYCLE:
+            result["detail"].append(
+                f"{len(allow)-WEATHER_DRIVER_MAX_GROUPS_PER_CYCLE} allowlisted groups beyond per-cycle cap NOT checked")
+    app.bot_data["weather_driver_last_result"] = {k: v for k,v in result.items() if k != "detail"}
+    app.bot_data["weather_driver_last_run"] = datetime.now(timezone.utc).isoformat()
+    return result
+
+
+async def driver_weather_loop(app):
+    """No loop started unless opt-in is complete at process startup."""
+    while True:
+        try:
+            await driver_weather_cycle(app)
+        except Exception as exc:
+            logger.warning("Driver weather loop cycle stopped safely (%s)", type(exc).__name__)
+        await asyncio.sleep(WEATHER_DRIVER_SCAN_SECONDS)
+
+
+async def weatherdriverstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not samsara_private_admin(update):
+        return
+    allow, err = driver_allowlist()
+    with get_connection() as conn:
+        counts = dict(conn.execute("SELECT state,COUNT(*) FROM weather_driver_deliveries GROUP BY state").fetchall())
+    await update.effective_message.reply_text(
+        "BUK SPEAKER | LIVE DRIVER WEATHER SAFETY GATE\n"
+        f"Driver delivery: {'ON (explicit opt-in)' if driver_weather_enabled() else 'OFF (safe default)'}\n"
+        f"Explicit groups allowlisted: {len(allow)}\n"
+        f"Configuration: {err or 'valid'}\n"
+        f"Check interval: {WEATHER_DRIVER_SCAN_SECONDS//60} minutes\n"
+        f"Max scanned per cycle: {WEATHER_DRIVER_MAX_GROUPS_PER_CYCLE}\n"
+        f"Max alerts per cycle: {WEATHER_DRIVER_MAX_ALERTS_PER_CYCLE}\n"
+        f"Delivered NWS notices recorded: {counts.get('sent',0)}\n"
+        f"Pending/uncertain notices (NEVER auto-replayed): {counts.get('pending',0)}\n"
+        f"Last cycle: {context.application.bot_data.get('weather_driver_last_run','none')}\n"
+        "Readiness: /weatherreadiness | Safe dry run: /weatherdriverdryrun\n"
+        "Delivery cannot start by installing this file alone."
+    )
+
+
+async def weatherdriverdryrun_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not samsara_private_admin(update):
+        return
+    await update.effective_message.reply_text("Running read-only LIVE NWS driver-route dry run. No driver messages will be sent.")
+    result = await driver_weather_cycle(context.application, dry_run=True)
+    fields = ["BUK SPEAKER | WEATHER DRIVER DRY RUN", "NO driver messages sent.",
+              f"Ready: {result['ready']} | GPS hold: {result['gps_hold']} | Blocked: {result['blocked']}",
+              f"Active NWS candidates: {result['warnings']} | Already handled: {result['duplicates']}",
+              f"NWS failures: {result['nws_failed']}", f"Status: {result['error'] or 'Complete'}"]
+    fields.extend(result['detail'][:25])
+    await update.effective_message.reply_text("\n".join(fields)[:3800])
+
+
+async def weatherdriverhistory_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not samsara_private_admin(update):
+        return
+    with get_connection() as conn:
+        rows = conn.execute("""SELECT chat_id,event,state,created_at FROM weather_driver_deliveries
+            ORDER BY created_at DESC LIMIT 20""").fetchall()
+    text = ["BUK SPEAKER | REAL DRIVER WEATHER AUDIT", "Private audit: no messages sent by this command."]
+    text.extend(f"Group {chat_id} | {event} | {state} | {stamp}" for chat_id,event,state,stamp in rows)
+    if not rows:
+        text.append("No real driver weather deliveries recorded.")
+    await update.effective_message.reply_text("\n".join(text)[:3800])
+
+
 def main():
     if not BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is missing. Set it in your cloud host's environment variables.")
@@ -3132,6 +3463,9 @@ def main():
     app.add_handler(CommandHandler("weatherpilotlivehistory", weatherpilotlivehistory_command))
     app.add_handler(CommandHandler("weathergpsissues", weathergpsissues_command))
     app.add_handler(CommandHandler("weatherreadiness", weatherreadiness_command))
+    app.add_handler(CommandHandler("weatherdriverstatus", weatherdriverstatus_command))
+    app.add_handler(CommandHandler("weatherdriverdryrun", weatherdriverdryrun_command))
+    app.add_handler(CommandHandler("weatherdriverhistory", weatherdriverhistory_command))
     app.add_handler(CommandHandler("gpshealthstatus", gpshealthstatus_command))
     app.add_handler(CommandHandler("weatheradminscan", weatheradminscan_command))
     app.add_handler(CommandHandler("samsaramatchpreview", samsaramatchpreview_command))
