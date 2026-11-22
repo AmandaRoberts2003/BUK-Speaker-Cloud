@@ -430,6 +430,16 @@ def init_database():
             sent_at TEXT,
             PRIMARY KEY(source_chat_id, alert_id)
         )""")
+        # V25 test-only simulation receipts: one attempt per scenario per build.
+        conn.execute("""CREATE TABLE IF NOT EXISTS weather_pilot_scenario_receipts (
+            destination_chat_id INTEGER NOT NULL,
+            scenario TEXT NOT NULL,
+            build TEXT NOT NULL,
+            state TEXT NOT NULL CHECK(state IN ('pending', 'sent')),
+            created_at TEXT NOT NULL,
+            sent_at TEXT,
+            PRIMARY KEY(destination_chat_id, scenario, build)
+        )""")
         # Archive is shared by authorized admins; no Telegram private-chat access is granted.
         conn.execute("""CREATE TABLE IF NOT EXISTS announcements (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2348,7 +2358,7 @@ async def samsaraunmatched_command(update: Update, context: ContextTypes.DEFAULT
             "Unmatched report failed. Check FadeHost logs for 'Unmatched fleet report command failed'.")
 
 
-SPEAKER_BUILD = "2026-11-21-live-nws-pilot-v24"
+SPEAKER_BUILD = "2026-11-21-weather-validation-v25"
 
 
 # V23: MANUAL, EXPLICITLY-APPROVED TEST-GROUP ONLY PILOT.
@@ -2382,6 +2392,8 @@ async def weatherpilotstatus_command(update: Update, context: ContextTypes.DEFAU
         "No automatic pilot deliveries. Live NWS mirrors are TEST-only.\n"
         "Simulation: /weatherpilottest TEST_GROUP_CHAT_ID CONFIRM\n"
         "Live NWS: /weatherpilotlive SOURCE_DRIVER_GROUP_ID CONFIRM\n"
+        "Simulation scenarios: /weatherpilotsim tornado|snow|wind|expired CONFIRM\n"
+        "Simulation history: /weatherpilotsimstatus\n"
         "History: /weatherpilotlivehistory"
     )
 
@@ -2455,6 +2467,145 @@ async def weatherpilottest_command(update: Update, context: ContextTypes.DEFAULT
 # v24: A real NWS warning can be mirrored ONLY to the explicitly configured TEST
 # group, under a manual private admin command. Never to a source driver group.
 # No scheduled live pilot and no activation of WEATHER_ENABLED.
+# V25: STATIC, EXPLICIT SIMULATION CASES. No Samsara/NWS API data is changed.
+# This manual feature cannot address driver groups under any configuration.
+WEATHER_PILOT_SCENARIOS = {
+    "tornado": ("Tornado Warning", "Example Test County, Test State", 45),
+    "snow": ("Winter Storm Warning", "Example Test County, Test State", 240),
+    "wind": ("High Wind Warning", "Example Test County, Test State", 90),
+}
+
+
+def pilot_simulated_record(scenario, now):
+    """Exercise the actual qualification formatter with unmistakably fictional data."""
+    if scenario == "expired":
+        event, area, offset = "Winter Storm Warning", "Example Test County", -1
+    else:
+        event, area, offset = WEATHER_PILOT_SCENARIOS[scenario]
+    feature = {"properties": {
+        "status": "Actual", "messageType": "Alert", "event": event,
+        "areaDesc": area, "id": f"SIMULATION-V25-{scenario}",
+        "effective": (now-timedelta(minutes=5)).isoformat(),
+        "onset": (now-timedelta(minutes=5)).isoformat(),
+        "expires": (now+timedelta(minutes=offset)).isoformat(),
+        "severity": "Severe"
+    }}
+    return weather_active_record(feature, now=now)
+
+
+async def weatherpilotsim_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin private only; manually send one static sample to one allowlisted TEST group."""
+    if not samsara_private_admin(update):
+        return
+    args = context.args or []
+    if len(args) != 2 or args[1] != "CONFIRM" or args[0].lower() not in (*WEATHER_PILOT_SCENARIOS, "expired"):
+        await update.effective_message.reply_text(
+            "Usage: /weatherpilotsim tornado|snow|wind|expired CONFIRM\n"
+            "Only an approved, non-driver TEST group may receive a sample."
+        )
+        return
+    scenario = args[0].lower()
+    now = datetime.now(timezone.utc)
+    info = pilot_simulated_record(scenario, now)
+    if info is None:
+        await update.effective_message.reply_text(
+            "PASS: expired or non-qualifying simulated warning REJECTED. "
+            "No message was sent to any group."
+        )
+        return
+    # No user-supplied destination. Explicit environment allowlist and live title.
+    if not re.fullmatch(r"-\d{5,20}", WEATHER_PILOT_TEST_CHAT_ID or ""):
+        await update.effective_message.reply_text("DENIED: test group allowlist missing or invalid.")
+        return
+    dest_id = int(WEATHER_PILOT_TEST_CHAT_ID)
+    with get_connection() as conn:
+        registered = conn.execute("SELECT 1 FROM groups WHERE chat_id=?", (dest_id,)).fetchone()
+        linked = conn.execute("SELECT 1 FROM samsara_group_links WHERE chat_id=?", (dest_id,)).fetchone()
+        prior = conn.execute("""SELECT state FROM weather_pilot_scenario_receipts
+            WHERE destination_chat_id=? AND scenario=? AND build=?""",
+            (dest_id, scenario, SPEAKER_BUILD)).fetchone()
+    if not registered or linked:
+        await update.effective_message.reply_text(
+            "DENIED: test group not registered or is linked to an operational Samsara vehicle."
+        )
+        return
+    if prior:
+        await update.effective_message.reply_text(
+            f"DUPLICATE SUPPRESSED: {scenario.upper()} simulation already reserved "
+            f"(state: {prior[0]}). No new message sent."
+        )
+        return
+    live = await get_live_group(dest_id, context)
+    if (not live or live.type not in (ChatType.GROUP, ChatType.SUPERGROUP)
+            or not weather_pilot_allowed(dest_id, live.title)):
+        await update.effective_message.reply_text("DENIED: live destination is not approved TEST group.")
+        return
+    # Last validation before send, including any newly created operational link.
+    latest = await get_live_group(dest_id, context)
+    with get_connection() as conn:
+        linked_now = conn.execute("SELECT 1 FROM samsara_group_links WHERE chat_id=?", (dest_id,)).fetchone()
+    if (not latest or latest.type not in (ChatType.GROUP, ChatType.SUPERGROUP)
+            or not weather_pilot_allowed(dest_id, latest.title) or linked_now):
+        await update.effective_message.reply_text("DENIED: test group status changed; nothing sent.")
+        return
+    # Atomic reservation is deliberately before transmission. Incomplete deliveries
+    # are never silently retried, avoiding unintended duplicate alarming messages.
+    try:
+        with get_connection() as conn:
+            conn.execute("""INSERT INTO weather_pilot_scenario_receipts
+                (destination_chat_id,scenario,build,state,created_at)
+                VALUES (?,?,?,?,?)""", (dest_id, scenario, SPEAKER_BUILD, "pending", now.isoformat()))
+    except sqlite3.IntegrityError:
+        await update.effective_message.reply_text("DUPLICATE SUPPRESSED. Nothing sent.")
+        return
+    text = (
+        "🧪 <b>BUK SPEAKER — CONTROLLED WEATHER SIMULATION</b>\n\n"
+        "<b>SIMULATION ONLY. NO REAL WEATHER WARNING. DO NOT TAKE ACTION BASED ON THIS TEST.</b>\n\n"
+        f"<b>Scenario:</b> {html.escape(scenario.upper())}\n"
+        "<b>Location:</b> Fictional test area — not an actual truck position\n"
+        "<b>Purpose:</b> Verify message formatting, instructions and duplicate safety.\n\n"
+    )
+    # Use the normal warning formatter, including its action and expiry display.
+    # Fictional area and event are always enclosed in a clear simulation banner.
+    parts = weather_message_parts(info, unit="TEST VEHICLE (FICTIONAL)", timezone_name="UTC")
+    try:
+        for part in parts:
+            await context.bot.send_message(
+                chat_id=dest_id, text=text + part + "\n\n🧪 <b>END OF SIMULATION — NOT LIVE.</b>",
+                parse_mode="HTML", disable_web_page_preview=True)
+    except TelegramError as exc:
+        logger.warning("V25 simulated pilot delivery incomplete (%s)", type(exc).__name__)
+        await update.effective_message.reply_text(
+            "Test may be incomplete. Receipt remains PENDING; duplicate replay blocked. "
+            "Inspect SPEAKER TEST. No drivers were contacted."
+        )
+        return
+    with get_connection() as conn:
+        conn.execute("""UPDATE weather_pilot_scenario_receipts
+            SET state='sent', sent_at=? WHERE destination_chat_id=? AND scenario=? AND build=?""",
+            (datetime.now(timezone.utc).isoformat(), dest_id, scenario, SPEAKER_BUILD))
+    await update.effective_message.reply_text(
+        f"SIMULATED {scenario.upper()} TEST SENT to {latest.title}.\n"
+        "Repeat the identical command to verify duplicate suppression.\n"
+        "Driver-group weather alerts remain OFF."
+    )
+
+
+async def weatherpilotsimstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Private read-only receipts without external API calls or group messages."""
+    if not samsara_private_admin(update):
+        return
+    with get_connection() as conn:
+        rows = conn.execute("""SELECT scenario,state,created_at FROM weather_pilot_scenario_receipts
+            WHERE build=? ORDER BY created_at""", (SPEAKER_BUILD,)).fetchall()
+    message = ["BUK SPEAKER | V25 WEATHER VALIDATION", "Production delivery: OFF.",
+               "Simulation destination: allowlisted TEST group only."]
+    message.extend(f"{sc}: {state} ({stamp})" for sc,state,stamp in rows)
+    if not rows:
+        message.append("No simulations attempted yet.")
+    await update.effective_message.reply_text("\n".join(message))
+
+
 async def weatherpilotlive_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Mirror one real, qualifying point-based NWS warning into TEST, once."""
     if not samsara_private_admin(update):
@@ -2886,6 +3037,8 @@ def main():
     app.add_handler(CommandHandler("weatheradminstatus", weatheradminstatus_command))
     app.add_handler(CommandHandler("weatherpilotstatus", weatherpilotstatus_command))
     app.add_handler(CommandHandler("weatherpilottest", weatherpilottest_command))
+    app.add_handler(CommandHandler("weatherpilotsim", weatherpilotsim_command))
+    app.add_handler(CommandHandler("weatherpilotsimstatus", weatherpilotsimstatus_command))
     app.add_handler(CommandHandler("weatherpilotlive", weatherpilotlive_command))
     app.add_handler(CommandHandler("weatherpilotlivehistory", weatherpilotlivehistory_command))
     app.add_handler(CommandHandler("weathergpsissues", weathergpsissues_command))
