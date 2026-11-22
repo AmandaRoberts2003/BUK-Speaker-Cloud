@@ -385,6 +385,14 @@ def init_database():
             sent_at TEXT NOT NULL,
             PRIMARY KEY (chat_id, event)
         )""")
+        # Historical group registry archive: no loss of announcements or GPS audits.
+        conn.execute("""CREATE TABLE IF NOT EXISTS archived_groups (
+            chat_id INTEGER PRIMARY KEY,
+            group_name TEXT NOT NULL,
+            archived_at TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            archived_by INTEGER NOT NULL
+        )""")
         # Explicit group-to-vehicle links are never inferred from names.
         conn.execute("""CREATE TABLE IF NOT EXISTS samsara_group_links (
             chat_id INTEGER PRIMARY KEY,
@@ -588,8 +596,80 @@ async def send_welcome_if_pending(chat_id: int, group_name: str, context: Contex
     return True
 
 
+def archive_group_registration(chat_id, reason, actor=0):
+    """Retire registration but retain historical messages/audit records.
+
+    Does not touch registered replacements, delivery history or announcements.
+    Any surviving vehicle link is retired to avoid unsafe delivery.
+    """
+    with get_connection() as conn:
+        row = conn.execute("SELECT group_name FROM groups WHERE chat_id=?", (chat_id,)).fetchone()
+        if not row:
+            return False
+        conn.execute("""INSERT INTO archived_groups(chat_id,group_name,archived_at,reason,archived_by)
+            VALUES(?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET
+            group_name=excluded.group_name,archived_at=excluded.archived_at,
+            reason=excluded.reason,archived_by=excluded.archived_by""",
+            (chat_id,row[0],datetime.now(timezone.utc).isoformat(),reason,actor))
+        conn.execute("DELETE FROM samsara_group_links WHERE chat_id=?", (chat_id,))
+        conn.execute("DELETE FROM samsara_match_reviews WHERE chat_id=?", (chat_id,))
+        conn.execute("DELETE FROM weather_locations WHERE chat_id=?", (chat_id,))
+        conn.execute("DELETE FROM groups WHERE chat_id=?", (chat_id,))
+    return True
+
+
+async def groupforget_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Explicit, private, one-ID archival of an obsolete, unlinked group."""
+    if not samsara_private_admin(update):
+        return
+    if len(context.args) != 2 or context.args[1] != "CONFIRM":
+        await update.effective_message.reply_text("Usage: /groupforget OLD_CHAT_ID CONFIRM (private admin only)")
+        return
+    try:
+        chat_id = int(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("Invalid Telegram group ID. No changes made.")
+        return
+    # The existing linked destination MUST NEVER be forgotten by this command.
+    with get_connection() as conn:
+        registered = conn.execute("SELECT group_name FROM groups WHERE chat_id=?", (chat_id,)).fetchone()
+        linked = conn.execute("SELECT vehicle_id FROM samsara_group_links WHERE chat_id=?", (chat_id,)).fetchone()
+    if not registered:
+        await update.effective_message.reply_text("Group is not in the active registry (possibly already archived).")
+        return
+    if linked:
+        await update.effective_message.reply_text(
+            "REFUSED: group is still linked to a Samsara vehicle. Unlink and verify its replacement first.")
+        return
+    # Recheck against live Telegram state. A live group is not automatically
+    # considered obsolete; require it to be inactive or a verified replacement
+    # with the same unit already linked, otherwise fail closed.
+    old_unit = group_unit_from_title(registered[0])
+    if old_unit:
+        with get_connection() as conn:
+            candidates = conn.execute("""SELECT g.chat_id,g.group_name FROM groups g
+                JOIN samsara_group_links l ON l.chat_id=g.chat_id
+                WHERE g.chat_id<>?""", (chat_id,)).fetchall()
+        replacements = [(c, t) for c,t in candidates if group_unit_from_title(t)==old_unit]
+        if len(replacements) != 1:
+            await update.effective_message.reply_text(
+                "REFUSED: a unique, linked replacement for this unit was not found. "
+                "Archive only after verifying the correct replacement group.")
+            return
+        replacement_id, _ = replacements[0]
+        verified = await get_live_group(replacement_id, context)
+        if not verified or group_unit_from_title(verified.title) != old_unit:
+            await update.effective_message.reply_text("REFUSED: replacement group could not be verified live.")
+            return
+    if archive_group_registration(chat_id, "admin-confirmed-obsolete", update.effective_user.id):
+        await update.effective_message.reply_text(
+            f"ARCHIVED group {chat_id}. Removed from /groups and automatic matching. "
+            "Historical messages and audit records preserved. "
+            "No message sent to any group.")
+
+
 async def on_bot_membership_change(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Automatically introduce the bot when it is first added to a group."""
+    """Register joining groups; archive only when Telegram confirms bot removal."""
     membership = update.my_chat_member
     if membership is None:
         return
@@ -600,6 +680,10 @@ async def on_bot_membership_change(update: Update, context: ContextTypes.DEFAULT
 
     old_status = membership.old_chat_member.status
     new_status = membership.new_chat_member.status
+    if new_status in ("left", "kicked") and old_status in ("member", "administrator", "restricted"):
+        archive_group_registration(chat.id, "telegram-confirmed-bot-removed", 0)
+        logger.info("Archived group %s after Telegram confirmed bot removal", chat.id)
+        return
     joined = old_status in ("left", "kicked") and new_status in ("member", "administrator")
     if not joined:
         return
@@ -2481,7 +2565,7 @@ async def samsaraunmatched_command(update: Update, context: ContextTypes.DEFAULT
             "Unmatched report failed. Check FadeHost logs for 'Unmatched fleet report command failed'.")
 
 
-SPEAKER_BUILD = "2026-11-21-complete-weather-controls-v27"
+SPEAKER_BUILD = "2026-11-22-group-registry-cleanup-v28"
 
 
 # V23: MANUAL, EXPLICITLY-APPROVED TEST-GROUP ONLY PILOT.
@@ -3453,6 +3537,7 @@ def main():
     app.add_handler(CommandHandler("samsaraautostatus", samsaraautostatus_command))
     app.add_handler(CommandHandler("samsaraautoscan", samsaraautoscan_command))
     app.add_handler(CommandHandler("groups", groups_command))
+    app.add_handler(CommandHandler("groupforget", groupforget_command))
     app.add_handler(CommandHandler("samsaraunmatched", samsaraunmatched_command))
     app.add_handler(CommandHandler("weatheradminstatus", weatheradminstatus_command))
     app.add_handler(CommandHandler("weatherpilotstatus", weatherpilotstatus_command))
