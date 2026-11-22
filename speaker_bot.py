@@ -2158,6 +2158,95 @@ async def gpshealthstatus_command(update: Update, context: ContextTypes.DEFAULT_
         await update.effective_message.reply_text(page)
 
 
+def weather_readiness_classify(title, vehicle_record, now, other_active_units=()):
+    """Explain source eligibility only, never authorize driver-group delivery."""
+    if not title:
+        return "REVIEW", "Telegram title unavailable"
+    if is_inactive_group_name(title):
+        return "EXCLUDED", "Group marked inactive"
+    unit = group_unit_from_title(title)
+    if not unit:
+        return "REVIEW", "Active group title has no exact BUK unit"
+    if unit in other_active_units:
+        return "REVIEW", "Same unit appears in multiple active registered groups"
+    if not isinstance(vehicle_record, dict):
+        return "REVIEW", "Linked Samsara vehicle missing from snapshot"
+    samsara_unit = vehicle_unit_from_name(vehicle_record.get("name"))
+    if samsara_unit != unit:
+        return "REVIEW", "Telegram unit and Samsara unit do not match"
+    if samsara_valid_gps(vehicle_record.get("gps"), now=now) is None:
+        reason, _ = gps_diagnostic_reason(vehicle_record, now)
+        return "WAIT_GPS", reason or "Unusable GPS location"
+    return "READY", "Verified active group, exact linked unit, fresh usable GPS"
+
+
+async def weatherreadiness_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Admin-private audit; NO driver messages, NO NWS calls, NO database writes."""
+    if not samsara_private_admin(update):
+        return
+    if not SAMSARA_API_TOKEN:
+        await update.effective_message.reply_text("READINESS AUDIT UNAVAILABLE: Samsara token missing. Driver alerts OFF.")
+        return
+    await update.effective_message.reply_text("Checking live Telegram group titles and Samsara GPS. Read-only; no driver messages.")
+    try:
+        vehicles = await asyncio.to_thread(samsara_get_gps_snapshot)
+    except Exception as exc:
+        logger.warning("Weather readiness Samsara snapshot failed (%s)", type(exc).__name__)
+        await update.effective_message.reply_text("READINESS AUDIT UNAVAILABLE: Samsara snapshot failed. Driver alerts OFF.")
+        return
+    with get_connection() as conn:
+        links = conn.execute("SELECT chat_id, vehicle_id FROM samsara_group_links ORDER BY chat_id").fetchall()
+        registered = conn.execute("SELECT chat_id FROM groups").fetchall()
+    # Verify all registered chats, including unlinked active groups. An unverifiable
+    # registration cannot authorize delivery, and may conflict with a known unit.
+    live_titles = {}
+    for (chat_id,) in registered:
+        live = await get_live_group(chat_id, context)
+        live_titles[chat_id] = (live.title if live and live.type in (ChatType.GROUP, ChatType.SUPERGROUP) else None)
+    unit_counts = {}
+    for title in live_titles.values():
+        unit = group_unit_from_title(title)
+        if unit:
+            unit_counts[unit] = unit_counts.get(unit, 0) + 1
+    conflicting = {unit for unit, count in unit_counts.items() if count > 1}
+    now = datetime.now(timezone.utc)
+    totals = {"READY": 0, "WAIT_GPS": 0, "REVIEW": 0, "EXCLUDED": 0}
+    entries = []
+    linked_ids = {chat_id for chat_id, _ in links}
+    for chat_id, vid in links:
+        title = live_titles.get(chat_id)
+        status, reason = weather_readiness_classify(title, vehicles.get(str(vid)), now, conflicting)
+        totals[status] += 1
+        unit = group_unit_from_title(title) or vehicle_unit_from_name(vehicles.get(str(vid), {}).get("name")) or "unknown"
+        entries.append(f"{status} | Unit {unit} | {title or 'UNVERIFIED GROUP'}\nGroup {chat_id} | {reason}")
+    unlinked_active = []
+    unknown_registrations = 0
+    for chat_id, title in live_titles.items():
+        if chat_id in linked_ids:
+            continue
+        if title is None:
+            unknown_registrations += 1
+        elif not is_inactive_group_name(title):
+            unlinked_active.append(f"{title} (group {chat_id})")
+    header = (
+        "BUK SPEAKER | WEATHER READINESS AUDIT (PRIVATE)\n"
+        f"Audit time: {now:%Y-%m-%d %H:%M} UTC\n"
+        f"Linked groups: {len(links)} | READY: {totals['READY']} | GPS HOLD: {totals['WAIT_GPS']}\n"
+        f"Link/title review: {totals['REVIEW']} | Inactive excluded: {totals['EXCLUDED']}\n"
+        f"Unlinked active registered groups: {len(unlinked_active)} | Unverifiable unlinked registrations: {unknown_registrations}\n"
+        f"GPS freshness limit: {SAMSARA_MAX_GPS_AGE_MINUTES} minutes\n"
+        "READY means eligible for PRIVATE monitoring only, NOT approved for driver delivery.\n"
+        "Production driver weather alerts: OFF (hard-disabled)."
+    )
+    pages = [header]
+    for entry in entries + (["UNLINKED ACTIVE GROUPS:"] + unlinked_active if unlinked_active else []):
+        if len(pages[-1]) + len(entry) + 2 > 3450:
+            pages.append("BUK SPEAKER | WEATHER READINESS (continued)")
+        pages[-1] += "\n\n" + entry
+    for page in pages:
+        await update.effective_message.reply_text(page)
+
+
 async def weatheradminstatus_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not samsara_private_admin(update):
         return
@@ -2358,7 +2447,7 @@ async def samsaraunmatched_command(update: Update, context: ContextTypes.DEFAULT
             "Unmatched report failed. Check FadeHost logs for 'Unmatched fleet report command failed'.")
 
 
-SPEAKER_BUILD = "2026-11-21-weather-validation-v25"
+SPEAKER_BUILD = "2026-11-21-weather-readiness-audit-v26"
 
 
 # V23: MANUAL, EXPLICITLY-APPROVED TEST-GROUP ONLY PILOT.
@@ -3042,6 +3131,7 @@ def main():
     app.add_handler(CommandHandler("weatherpilotlive", weatherpilotlive_command))
     app.add_handler(CommandHandler("weatherpilotlivehistory", weatherpilotlivehistory_command))
     app.add_handler(CommandHandler("weathergpsissues", weathergpsissues_command))
+    app.add_handler(CommandHandler("weatherreadiness", weatherreadiness_command))
     app.add_handler(CommandHandler("gpshealthstatus", gpshealthstatus_command))
     app.add_handler(CommandHandler("weatheradminscan", weatheradminscan_command))
     app.add_handler(CommandHandler("samsaramatchpreview", samsaramatchpreview_command))
